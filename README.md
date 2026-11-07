@@ -77,17 +77,17 @@ locally and pass `-DFETCHCONTENT_SOURCE_DIR_SDL3=/absolute/path/to/SDL3-3.4.20`.
 | First / last page | Home / End |
 | Draw smooth red ink | Hold left or right mouse button and drag |
 | Follow a PDF link | Left-click without dragging |
-| Draw a dot | Click a blank area, or right-click |
 | Play / pause an animation | Click its small bottom-center icon |
 | Type dark blue text at the pointer | T, then type; Shift+Enter for a new line |
-| Finish / cancel text | Enter / Escape |
+| Finish / cancel text | Enter, Down or a click / Escape |
 | Clear current ink | C or Delete |
 | Toggle fullscreen | F |
 | Quit | Escape or Q |
 
 A four-window-coordinate-pixel drag threshold distinguishes link clicks from
-strokes. Links show a hand cursor. Ink uses midpoint quadratic smoothing,
-converted to cubic curves and adaptively flattened. Both taps and strokes use a
+strokes. A click without a drag draws nothing; ink starts only once the mouse
+moves past the threshold. Links show a hand cursor. Ink uses midpoint quadratic
+smoothing, converted to cubic curves and adaptively flattened. Strokes use a
 7-output-pixel-diameter red brush: the inner 70% of its radius is solid, with a
 smooth cubic fade through the outer 30% and a pixel-filtered edge. Coverage is
 combined within each stroke so overlapping segments do not darken its feather.
@@ -97,10 +97,12 @@ resize or fullscreen transitions, and is never written to the PDF. Returning to
 a page shows the clean page. The file is opened read-only.
 
 Press T to type text at the mouse pointer: the first line's capitals are
-centered vertically on the pointer. Text is 18 output pixels (em size) in dark
-blue. While typing, every key enters text instead of acting as a shortcut.
-Backspace deletes the last character, Shift+Enter starts a new line, Enter
-finishes and Escape discards the text. Finished text is rasterized into the ink
+centered vertically on the pointer. Text is dark blue and presentation-sized:
+its em size is 7% of the output height (the full screen height in fullscreen),
+independent of resolution and display scaling. While typing, every key enters
+text instead of acting as a shortcut. Backspace deletes the last character,
+Shift+Enter starts a new line, and Escape discards the text. Enter, Down or a
+mouse click finishes it; that click draws no dot and follows no link. Finished text is rasterized into the ink
 layer, so it is clipped to the page and cleared together with pen strokes.
 Glyphs come from a system TrueType font (Segoe UI or Arial on Windows, Arial or
 Helvetica on macOS, DejaVu, Liberation or Noto Sans on Linux). Choose another

@@ -70,14 +70,30 @@ int main(int argc, char **argv) {
     CHECK(a.refresh);
     CHECK(rebuild(&a));
     CHECK(a.ink_canvas.pixels[pixel + 3] == 0);
-    /* A tap has the same seven-output-pixel soft tip as a dragged stroke. */
+    /* A click without a drag (left or right) draws nothing. */
+    size_t dot = ((size_t)120 * a.canvas.w + 200) * 4;
     mouse(&a, SDL_EVENT_MOUSE_BUTTON_DOWN, 200.5f, 120.5f);
     mouse(&a, SDL_EVENT_MOUSE_BUTTON_UP, 200.5f, 120.5f);
-    size_t dot = ((size_t)120 * a.canvas.w + 200) * 4;
+    CHECK(!a.down && !a.drawing && a.ink_canvas.pixels[dot + 3] == 0);
+    SDL_Event right = {0};
+    right.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+    right.button.button = SDL_BUTTON_RIGHT;
+    right.button.x = 200.5f;
+    right.button.y = 120.5f;
+    CHECK(event(&a, &right));
+    right.type = SDL_EVENT_MOUSE_BUTTON_UP;
+    CHECK(event(&a, &right));
+    CHECK(!a.down && a.ink_canvas.pixels[dot + 3] == 0);
+    /* A dragged stroke has a seven-output-pixel soft tip. */
+    mouse(&a, SDL_EVENT_MOUSE_BUTTON_DOWN, 190.5f, 120.5f);
+    mouse(&a, SDL_EVENT_MOUSE_MOTION, 200.5f, 120.5f);
+    mouse(&a, SDL_EVENT_MOUSE_MOTION, 210.5f, 120.5f);
+    mouse(&a, SDL_EVENT_MOUSE_BUTTON_UP, 210.5f, 120.5f);
+    size_t w = (size_t)a.canvas.w;
     CHECK(a.ink_canvas.pixels[dot] == 0xe5 && a.ink_canvas.pixels[dot + 1] == 0x2b);
-    CHECK(a.brush.coverage[dot / 4 + 1] == 255);
-    CHECK(a.brush.coverage[dot / 4 + 3] > 0 && a.brush.coverage[dot / 4 + 3] < 200);
-    CHECK(a.brush.coverage[dot / 4 + 4] == 0);
+    CHECK(a.brush.coverage[dot / 4 + w] == 255);
+    CHECK(a.brush.coverage[dot / 4 + 3 * w] > 0 && a.brush.coverage[dot / 4 + 3 * w] < 200);
+    CHECK(a.brush.coverage[dot / 4 + 4 * w] == 0);
     key.key.key = SDLK_C;
     CHECK(event(&a, &key));
     CHECK(rebuild(&a));
@@ -91,8 +107,9 @@ int main(int argc, char **argv) {
     SDL_GetMouseState(&mx, &my);
     press(&a, SDLK_T, 0);
     CHECK(a.typing && a.text_len == 0);
+    CHECK(a.text_size == round(a.h * .07)); /* 7% of the output height. */
     Point o = a.text_origin;
-    CHECK(o.x == round(mx) && o.y == round(my + text_metrics(a.font, TEXT_SIZE).cap_height / 2));
+    CHECK(o.x == round(mx) && o.y == round(my + text_metrics(a.font, a.text_size).cap_height / 2));
     type(&a, "t"); /* The T key's own character is not inserted. */
     type(&a, "H");
     press(&a, SDLK_N, 0);
@@ -109,10 +126,11 @@ int main(int argc, char **argv) {
     press(&a, SDLK_RETURN, SDL_KMOD_LSHIFT);
     type(&a, "H");
     CHECK(!strcmp(a.text, "H\nH") && a.text_texture && present(&a));
-    /* At 18 px the fixture's H square spans 1.8..10.8 px right of the origin
-     * and 13 hinted pixels above the baseline. */
-    size_t first = ((size_t)(o.y - 5) * a.canvas.w + (size_t)(o.x + 5)) * 4;
-    size_t second = first + (size_t)text_metrics(a.font, TEXT_SIZE).line_height * a.canvas.w * 4;
+    /* The fixture's H square spans 0.1..0.6 em right of the origin and its
+     * 0.7 em cap height above the baseline; sample near its center. */
+    size_t cx = (size_t)(o.x + round(a.text_size * .35)), cy = (size_t)(o.y - round(a.text_size * .35));
+    size_t first = (cy * a.canvas.w + cx) * 4;
+    size_t second = first + (size_t)text_metrics(a.font, a.text_size).line_height * a.canvas.w * 4;
     a.running = true;
     press(&a, SDLK_ESCAPE, 0); /* Cancels the text instead of quitting. */
     CHECK(!a.typing && a.running && !a.text_texture && a.text_len == 0);
@@ -133,6 +151,25 @@ int main(int argc, char **argv) {
     CHECK(event(&a, &key));
     CHECK(rebuild(&a));
     CHECK(a.ink_canvas.pixels[first + 3] == 0 && a.ink_canvas.pixels[second + 3] == 0);
+    /* Down finishes the text instead of changing the page. */
+    press(&a, SDLK_T, 0);
+    type(&a, "H");
+    press(&a, SDLK_DOWN, 0);
+    CHECK(!a.typing && a.page == 0 && !a.refresh && a.ink_canvas.pixels[first + 3] == 255);
+    key.key.key = SDLK_C;
+    CHECK(event(&a, &key));
+    CHECK(rebuild(&a));
+    /* A click finishes the text and is consumed: no link, no dot. */
+    press(&a, SDLK_T, 0);
+    type(&a, "H");
+    mouse(&a, SDL_EVENT_MOUSE_BUTTON_DOWN, 300, 90);
+    mouse(&a, SDL_EVENT_MOUSE_BUTTON_UP, 300, 90);
+    CHECK(!a.typing && !a.down && a.page == 0 && !a.refresh);
+    CHECK(a.ink_canvas.pixels[first + 3] == 255);
+    CHECK(a.ink_canvas.pixels[((size_t)90 * a.canvas.w + 300) * 4 + 3] == 0);
+    key.key.key = SDLK_C;
+    CHECK(event(&a, &key));
+    CHECK(rebuild(&a));
     /* A tap on the PDF link goes to the rotated second page. */
     mouse(&a, SDL_EVENT_MOUSE_BUTTON_DOWN, 300, 90);
     mouse(&a, SDL_EVENT_MOUSE_BUTTON_UP, 300, 90);

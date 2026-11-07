@@ -8,8 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TEXT_SIZE 18.0    /* Em size in output pixels, like the pen diameter. */
-#define TEXT_RGB 0x0f2f8f /* Dark blue. */
+#define TEXT_SCREEN_FRACTION .07 /* Em size relative to the output height. */
+#define TEXT_RGB 0x0f2f8f        /* Dark blue. */
 
 typedef struct {
     const PdfAnimation *info;
@@ -47,6 +47,7 @@ typedef struct {
     Point text_origin;
     SDL_Texture *text_texture;
     SDL_FRect text_rect, caret;
+    double text_size; /* Em size in output pixels, fixed while typing. */
 } App;
 static void free_playbacks(App *a) {
     for (int i = 0; i < a->playback_count; i++) {
@@ -153,14 +154,14 @@ static bool text_preview(App *a) {
     a->dirty = true;
     Path path = {0};
     Point caret;
-    if (!text_path(a->font, a->text, TEXT_SIZE, a->text_origin, &path, &caret)) {
+    if (!text_path(a->font, a->text, a->text_size, a->text_origin, &path, &caret)) {
         path_free(&path);
         return SDL_SetError("Cannot lay out text");
     }
-    TextMetrics m = text_metrics(a->font, TEXT_SIZE);
-    double above = m.cap_height + round(TEXT_SIZE * .12), below = round(TEXT_SIZE * .22);
+    TextMetrics m = text_metrics(a->font, a->text_size);
+    double above = m.cap_height + round(a->text_size * .12), below = round(a->text_size * .22);
     a->caret = (SDL_FRect){(float)round(caret.x), (float)(caret.y - above),
-                           (float)fmax(1, round(TEXT_SIZE / 16)), (float)(above + below)};
+                           (float)fmax(1, round(a->text_size / 24)), (float)(above + below)};
     Box clip = a->canvas.clip;
     double xmin = clip.x1, xmax = clip.x0, ymin = clip.y1, ymax = clip.y0;
     for (size_t i = 0; i < path.count; i++) {
@@ -219,14 +220,19 @@ static bool text_start(App *a) {
     float wx = 0, wy = 0;
     SDL_GetMouseState(&wx, &wy);
     Point p = position(a, wx, wy);
+    /* Presentation-sized text: a fixed share of the output (screen) height,
+     * so it looks the same at any resolution or display scale. */
+    a->text_size = fmax(8, round(a->h * TEXT_SCREEN_FRACTION));
     /* Center the first line's capitals vertically on the pointer. */
-    TextMetrics m = text_metrics(a->font, TEXT_SIZE);
+    TextMetrics m = text_metrics(a->font, a->text_size);
     a->text_origin = (Point){round(p.x), round(p.y + m.cap_height * .5)};
     a->text_len = 0;
     a->text[0] = 0;
     a->typing = true;
     a->swallow_t = true; /* The T key's own character may still follow. */
-    SDL_Rect area = {(int)wx, (int)wy - 12, 1, 24};
+    float density = SDL_GetWindowPixelDensity(a->window);
+    float line = (float)a->text_size / (density > 0 ? density : 1); /* window units */
+    SDL_Rect area = {(int)wx, (int)(wy - line / 2), 1, (int)line};
     SDL_SetTextInputArea(a->window, &area, 0);
     SDL_StartTextInput(a->window);
     SDL_HideCursor();
@@ -238,7 +244,7 @@ static bool text_commit(App *a) {
         if (!ensure_ink_layer(a))
             return false;
         Path path = {0};
-        ok = text_path(a->font, a->text, TEXT_SIZE, a->text_origin, &path, NULL) &&
+        ok = text_path(a->font, a->text, a->text_size, a->text_origin, &path, NULL) &&
              canvas_fill(&a->ink_canvas, &path, TEXT_RGB, false);
         path_free(&path);
         if (!ok)
@@ -270,6 +276,8 @@ static bool text_key(App *a, const SDL_KeyboardEvent *k) {
     case SDLK_KP_ENTER:
         if (k->mod & SDL_KMOD_SHIFT)
             return text_insert(a, "\n");
+        return k->repeat || text_commit(a);
+    case SDLK_DOWN: /* Finishes the text; it does not change the page. */
         return k->repeat || text_commit(a);
     case SDLK_BACKSPACE:
         if (!a->text_len)
@@ -563,6 +571,10 @@ static bool event(App *a, SDL_Event *e) {
         SDL_HideCursor();
         return text_insert(a, e->text.text);
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        /* A click finishes pending text and is consumed: it neither leaves a
+         * dot nor follows a link. */
+        if (a->typing)
+            return text_commit(a);
         if (a->refresh || a->down ||
             (e->button.button != SDL_BUTTON_LEFT && e->button.button != SDL_BUTTON_RIGHT))
             break;
@@ -622,12 +634,7 @@ static bool event(App *a, SDL_Event *e) {
                         SDL_Log("Cannot open URL: %s", SDL_GetError());
                 } else
                     change_page(a, link.page);
-            } else {
-                if (!begin_pen(a))
-                    return false;
-                brush_line(&a->brush, &a->ink_canvas, p, p);
-                a->dirty = a->ink_dirty = true;
-            }
+            } /* A click without a drag draws nothing. */
         }
         break;
     }
