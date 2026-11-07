@@ -1,0 +1,12 @@
+% Compile from the repository root:
+% xelatex -output-directory=build latex/animation-example.tex
+\documentclass{article}
+\usepackage{latex/sdlpdf-animation}
+\pagestyle{empty}
+\begin{document}
+% These tiny test assets are included in the repository. Substitute your files.
+\fbox{\pdfanimation[fps=12]{5cm}{5cm}{tests/fixtures/animation-disposal.gif}}
+\qquad
+\fbox{\pdfanimation[fps=24,autoplay=true,interpolation=bicubic]
+  {5cm}{5cm}{tests/fixtures/animation-disposal.apng}}
+\end{document}

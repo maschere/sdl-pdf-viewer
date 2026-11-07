@@ -1,0 +1,48 @@
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{sdlpdf-animation}[2026/11/07 In-place GIF/APNG for SDL PDF Viewer]
+\RequirePackage{attachfile2}
+\RequirePackage{keyval}
+\makeatletter
+\define@key{sdlanim}{fps}{\def\sdlanim@fps{#1}}
+\define@key{sdlanim}{autoplay}[true]{%
+  \def\sdlanim@value{#1}\def\sdlanim@true{true}\def\sdlanim@false{false}%
+  \ifx\sdlanim@value\sdlanim@true
+    \def\sdlanim@autoplay{true}%
+  \else\ifx\sdlanim@value\sdlanim@false
+    \def\sdlanim@autoplay{false}%
+  \else
+    \PackageError{sdlpdf-animation}{autoplay must be true or false}{}%
+  \fi\fi}
+\define@key{sdlanim}{interpolation}{%
+  \def\sdlanim@value{#1}\def\sdlanim@nearest{nearest}\def\sdlanim@bicubic{bicubic}%
+  \ifx\sdlanim@value\sdlanim@nearest
+    \def\sdlanim@interpolation{nearest}%
+  \else\ifx\sdlanim@value\sdlanim@bicubic
+    \def\sdlanim@interpolation{bicubic}%
+  \else
+    \PackageError{sdlpdf-animation}{interpolation must be nearest or bicubic}{}%
+  \fi\fi}
+% #1 keys; #2 width; #3 height; #4 GIF/APNG file. Wrap in \fbox if desired.
+% The text attachment's /Rect is exactly the reserved TeX box, with no added
+% strut, baseline offset or page-position bookkeeping. Works with XeLaTeX.
+\DeclareRobustCommand{\pdfanimation}[4][]{%
+  \begingroup
+    \def\sdlanim@fps{24}\def\sdlanim@autoplay{false}%
+    \def\sdlanim@interpolation{nearest}%
+    \setkeys{sdlanim}{#1}%
+    \ifdim#2>0pt\else\PackageError{sdlpdf-animation}{Width must be positive}{}\fi
+    \ifdim#3>0pt\else\PackageError{sdlpdf-animation}{Height must be positive}{}\fi
+    \let\strut\relax
+    \IfFileExists{#4}{%
+      \textattachfile[print=false,color={0 0 0},%
+        subject={SDLAnim fps=\sdlanim@fps\space autoplay=\sdlanim@autoplay\space
+          interpolation=\sdlanim@interpolation}]{#4}{%
+        \makebox[#2][l]{\rule{0pt}{#3}}}%
+    }{%
+      \PackageError{sdlpdf-animation}{Animation file `\detokenize{#4}' not found}{%
+        Check the attachment filename and its path relative to your LaTeX project.%
+        \MessageBreak The missing file will not be passed to attachfile2.}%
+    }%
+  \endgroup}
+\makeatother
+\endinput

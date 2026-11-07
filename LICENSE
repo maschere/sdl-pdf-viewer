@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 Maximilian
+Copyright (c) 2026 Maximilian Scherer
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,62 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Scope
+-----
+
+The MIT License above applies to original SDL PDF Viewer code and documentation,
+including the GIF/APNG integration, animation playback and interpolation code,
+and latex/sdlpdf-animation.sty. It does not replace the licenses of third-party
+dependencies or third-party test documents, embedded fonts, images and animations.
+Those materials retain their respective copyright notices and licensing terms.
+
+Third-party runtime dependencies
+--------------------------------
+
+SDL3
+  License: zlib license (Zlib).
+  Copyright (C) 1997-2026 Sam Lantinga and other SDL contributors.
+  Upstream license: LICENSE.txt in the SDL distribution.
+
+zlib
+  License: zlib license (Zlib).
+  Copyright (C) 1995-2026 Jean-loup Gailly and Mark Adler.
+  Upstream license: LICENSE in the zlib distribution.
+
+libjpeg / libjpeg-turbo
+  Licenses: Independent JPEG Group license (IJG), Modified BSD license
+  (BSD-3-Clause), and applicable component licenses, including Zlib.
+  Upstream notices: README.ijg and LICENSE.md in the libjpeg-turbo distribution,
+  or the corresponding notices in the chosen libjpeg distribution.
+
+  This software is based in part on the work of the Independent JPEG Group.
+
+giflib
+  License: MIT License (MIT).
+  Upstream license and copyright notices: COPYING and the source-file headers
+  in the giflib distribution.
+
+libpng
+  License: PNG Reference Library License version 2 (libpng-2.0), with historical
+  notices retained in the upstream license file.
+  Copyright (c) 1995-2026 The PNG Reference Library Authors and other copyright
+  holders identified in that file.
+  Upstream license: LICENSE in the libpng distribution.
+
+LaTeX dependencies
+------------------
+
+The optional LaTeX command uses attachfile2 and keyval from the user's TeX
+installation. These packages are licensed under the LaTeX Project Public License,
+version 1.3c or (at the user's option) any later version. They are separate from
+the original MIT-licensed sdlpdf-animation.sty wrapper.
+
+Redistribution notices
+----------------------
+
+Dependency source trees and binary libraries retain their upstream licenses,
+whether downloaded during the build, linked statically, or supplied as DLLs.
+Include the applicable upstream copyright notices, license texts and required
+acknowledgements when redistributing those components. The descriptions above
+identify the dependencies; they are not substitutes for their full license texts.
