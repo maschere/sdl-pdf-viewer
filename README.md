@@ -21,11 +21,12 @@ ctest --test-dir build --output-on-failure
 ./build/sdl-pdf-viewer tests/fixtures/demo.pdf
 ```
 
-CMake downloads the exact SDL **3.4.20** source archive and verifies its SHA-256.
+CMake uses an installed SDL3 package (3.4 or newer) when it finds one, such as
+Homebrew's `sdl3` or vcpkg's `sdl3`. Otherwise it downloads the exact SDL
+**3.4.20** source archive, verifies its SHA-256 and links SDL statically.
 zlib, libjpeg/libjpeg-turbo, giflib and libpng are used only for stream and image
 decoding; the PDF renderer itself is application code. All are C libraries and
-must be installed first. SDL is
-linked statically; codec libraries may be dynamically linked. This builds a
+must be installed first; they may be dynamically linked. This builds a
 command-line executable, not a signed/notarized `.app` bundle.
 
 ## Linux and Windows
@@ -41,20 +42,31 @@ ctest --test-dir build --output-on-failure
 ./build/sdl-pdf-viewer file.pdf
 ```
 
-On Windows, install Visual Studio's C compiler, CMake, and vcpkg. Install
-`libjpeg-turbo:x64-windows zlib:x64-windows giflib:x64-windows libpng:x64-windows`
-with vcpkg, configure with its
-`CMAKE_TOOLCHAIN_FILE`, and build with `--config Release`. The executable is
-`build/Release/sdl-pdf-viewer.exe`; place the codec DLLs beside it if necessary.
-The Windows runtime folder needs `jpeg62.dll`, `z.dll`, `gif.dll` and
-`libpng16.dll` when using the dynamic vcpkg triplet; vcpkg's CMake integration
-copies them beside the executables automatically. SDL remains statically linked.
+On Windows, install Visual Studio's C compiler, CMake, and vcpkg, then install
+the dependencies including SDL3 with vcpkg and configure with its toolchain file:
+
+```sh
+vcpkg install sdl3:x64-windows libjpeg-turbo:x64-windows zlib:x64-windows giflib:x64-windows libpng:x64-windows
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64   -DCMAKE_TOOLCHAIN_FILE=F:/GIT/vcpkg/scripts/buildsystems/vcpkg.cmake   -DVCPKG_TARGET_TRIPLET=x64-windows
+cmake --build build --config Release --parallel
+ctest --test-dir build -C Release --output-on-failure
+```
+
+The executable is `build/Release/sdl-pdf-viewer.exe`. With the dynamic vcpkg
+triplet it needs `SDL3.dll`, `jpeg62.dll`, `z.dll`, `gif.dll` and `libpng16.dll`;
+vcpkg's CMake integration copies them beside the executables automatically.
+
+For an AddressSanitizer build with MSVC, configure a second tree with
+`"-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS /fsanitize=address"` and
+`"-DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO=/debug /INCREMENTAL:NO"`, build with
+`--config RelWithDebInfo`, and put `clang_rt.asan_dynamic-x86_64.dll` from the
+MSVC `bin/Hostx64/x64` folder beside the executables (or on `PATH`).
 The included GitHub Actions workflow configures builds/tests for all three
 platforms. That workflow is supplied for running on your repository; its remote
 jobs have not been executed as part of this delivery.
 
-For an offline build, unpack the verified SDL release locally and pass
-`-DFETCHCONTENT_SOURCE_DIR_SDL3=/absolute/path/to/SDL3-3.4.20` to CMake.
+For an offline build without an SDL3 package, unpack the verified SDL release
+locally and pass `-DFETCHCONTENT_SOURCE_DIR_SDL3=/absolute/path/to/SDL3-3.4.20`.
 
 ## Controls
 
@@ -67,6 +79,8 @@ For an offline build, unpack the verified SDL release locally and pass
 | Follow a PDF link | Left-click without dragging |
 | Draw a dot | Click a blank area, or right-click |
 | Play / pause an animation | Click its small bottom-center icon |
+| Type dark blue text at the pointer | T, then type; Shift+Enter for a new line |
+| Finish / cancel text | Enter / Escape |
 | Clear current ink | C or Delete |
 | Toggle fullscreen | F |
 | Quit | Escape or Q |
@@ -81,6 +95,22 @@ The diameter is measured in physical output pixels, including on high-DPI displa
 Ink is clipped to the current page. Ink is discarded on navigation,
 resize or fullscreen transitions, and is never written to the PDF. Returning to
 a page shows the clean page. The file is opened read-only.
+
+Press T to type text at the mouse pointer: the first line's capitals are
+centered vertically on the pointer. Text is 18 output pixels (em size) in dark
+blue. While typing, every key enters text instead of acting as a shortcut.
+Backspace deletes the last character, Shift+Enter starts a new line, Enter
+finishes and Escape discards the text. Finished text is rasterized into the ink
+layer, so it is clipped to the page and cleared together with pen strokes.
+Glyphs come from a system TrueType font (Segoe UI or Arial on Windows, Arial or
+Helvetica on macOS, DejaVu, Liberation or Noto Sans on Linux). Choose another
+with `--font file.ttf` or the `SDL_PDF_VIEWER_FONT` environment variable. The
+application's own TrueType reader (`src/text.c`) handles glyf outlines, composite
+glyphs, cmap formats 4/12, collections and legacy `kern` pair kerning. The
+outlines are filled by the same coverage rasterizer as PDF text. Light vertical
+hinting snaps the baseline, x-height and cap height to whole pixels. Horizontal
+positions stay fractional. CFF-flavored OpenType (`.otf`) fonts, GPOS kerning and
+complex-script shaping are not supported.
 
 Pages are fitted and letterboxed without changing the display resolution.
 Mouse coordinates are converted through SDL's high-DPI coordinate conversion

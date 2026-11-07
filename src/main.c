@@ -1,11 +1,15 @@
 /* Application code is ISO C11; SDL's platform backends are external. */
 #include "pdf.h"
 #include "brush.h"
+#include "text.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define TEXT_SIZE 18.0    /* Em size in output pixels, like the pen diameter. */
+#define TEXT_RGB 0x0f2f8f /* Dark blue. */
 
 typedef struct {
     const PdfAnimation *info;
@@ -34,6 +38,15 @@ typedef struct {
     int playback_count, playback_page;
     bool playbacks_loaded, page_dirty, ink_dirty;
     double fps_override;
+    /* Text tool: typed text is previewed on its own small texture and
+     * rasterized into the ink layer when finished. */
+    TextFont *font;
+    bool font_failed, typing, swallow_t;
+    char text[4096];
+    size_t text_len;
+    Point text_origin;
+    SDL_Texture *text_texture;
+    SDL_FRect text_rect, caret;
 } App;
 static void free_playbacks(App *a) {
     for (int i = 0; i < a->playback_count; i++) {
@@ -98,7 +111,7 @@ static int control_at(const App *a, Point point) {
     }
     return -1;
 }
-static bool begin_pen(App *a) {
+static bool ensure_ink_layer(App *a) {
     if (!a->ink_canvas.pixels) {
         if (!canvas_init(&a->ink_canvas, a->w, a->h))
             return SDL_SetError("Cannot allocate ink layer");
@@ -111,9 +124,164 @@ static bool begin_pen(App *a) {
         if (!a->ink_texture || !SDL_SetTextureBlendMode(a->ink_texture, SDL_BLENDMODE_BLEND))
             return false;
     }
+    return true;
+}
+static bool begin_pen(App *a) {
+    if (!ensure_ink_layer(a))
+        return false;
     if (!brush_begin(&a->brush, &a->ink_canvas, 7, .70, 0xe52b37))
         return SDL_SetError("Cannot allocate pen buffers");
     return true;
+}
+static Point position(App *a, float wx, float wy);
+static void text_stop(App *a) {
+    if (a->typing)
+        SDL_StopTextInput(a->window);
+    a->typing = a->swallow_t = false;
+    a->text_len = 0;
+    a->text[0] = 0;
+    SDL_DestroyTexture(a->text_texture);
+    a->text_texture = NULL;
+    SDL_ShowCursor();
+    a->dirty = true;
+}
+/* Lays out the pending text, renders it into a texture covering just its
+ * bounds and places the caret. The fill is identical to the final ink. */
+static bool text_preview(App *a) {
+    SDL_DestroyTexture(a->text_texture);
+    a->text_texture = NULL;
+    a->dirty = true;
+    Path path = {0};
+    Point caret;
+    if (!text_path(a->font, a->text, TEXT_SIZE, a->text_origin, &path, &caret)) {
+        path_free(&path);
+        return SDL_SetError("Cannot lay out text");
+    }
+    TextMetrics m = text_metrics(a->font, TEXT_SIZE);
+    double above = m.cap_height + round(TEXT_SIZE * .12), below = round(TEXT_SIZE * .22);
+    a->caret = (SDL_FRect){(float)round(caret.x), (float)(caret.y - above),
+                           (float)fmax(1, round(TEXT_SIZE / 16)), (float)(above + below)};
+    Box clip = a->canvas.clip;
+    double xmin = clip.x1, xmax = clip.x0, ymin = clip.y1, ymax = clip.y0;
+    for (size_t i = 0; i < path.count; i++) {
+        Edge e = path.edges[i];
+        xmin = fmin(xmin, fmin(e.a.x, e.b.x));
+        xmax = fmax(xmax, fmax(e.a.x, e.b.x));
+        ymin = fmin(ymin, fmin(e.a.y, e.b.y));
+        ymax = fmax(ymax, fmax(e.a.y, e.b.y));
+    }
+    int x0 = (int)floor(fmax(xmin, clip.x0)), x1 = (int)ceil(fmin(xmax, clip.x1));
+    int y0 = (int)floor(fmax(ymin, clip.y0)), y1 = (int)ceil(fmin(ymax, clip.y1));
+    if (x1 <= x0 || y1 <= y0) {
+        path_free(&path);
+        return true;
+    }
+    Canvas c;
+    if (!canvas_init(&c, x1 - x0, y1 - y0)) {
+        path_free(&path);
+        return SDL_SetError("Cannot allocate text preview");
+    }
+    memset(c.pixels, 0, (size_t)c.w * c.h * 4);
+    c.clip = (Box){clip.x0 - x0, clip.y0 - y0, clip.x1 - x0, clip.y1 - y0};
+    for (size_t i = 0; i < path.count; i++) {
+        Edge *e = &path.edges[i];
+        e->a.x -= x0;
+        e->b.x -= x0;
+        e->a.y -= y0;
+        e->b.y -= y0;
+    }
+    bool ok = canvas_fill(&c, &path, TEXT_RGB, false);
+    path_free(&path);
+    if (!ok)
+        SDL_SetError("Cannot render text");
+    else {
+        a->text_texture = SDL_CreateTexture(a->renderer, SDL_PIXELFORMAT_RGBA32,
+                                            SDL_TEXTUREACCESS_STATIC, c.w, c.h);
+        ok = a->text_texture && SDL_SetTextureBlendMode(a->text_texture, SDL_BLENDMODE_BLEND) &&
+             SDL_SetTextureScaleMode(a->text_texture, SDL_SCALEMODE_NEAREST) &&
+             SDL_UpdateTexture(a->text_texture, NULL, c.pixels, c.w * 4);
+        a->text_rect = (SDL_FRect){(float)x0, (float)y0, (float)c.w, (float)c.h};
+    }
+    canvas_free(&c);
+    return ok;
+}
+static bool text_start(App *a) {
+    if (!a->font && !a->font_failed) {
+        a->font = text_font_open_default();
+        if (!a->font) {
+            a->font_failed = true;
+            SDL_Log("Text tool unavailable: no TrueType font found "
+                    "(use --font file.ttf or SDL_PDF_VIEWER_FONT)");
+        }
+    }
+    if (!a->font)
+        return true;
+    float wx = 0, wy = 0;
+    SDL_GetMouseState(&wx, &wy);
+    Point p = position(a, wx, wy);
+    /* Center the first line's capitals vertically on the pointer. */
+    TextMetrics m = text_metrics(a->font, TEXT_SIZE);
+    a->text_origin = (Point){round(p.x), round(p.y + m.cap_height * .5)};
+    a->text_len = 0;
+    a->text[0] = 0;
+    a->typing = true;
+    a->swallow_t = true; /* The T key's own character may still follow. */
+    SDL_Rect area = {(int)wx, (int)wy - 12, 1, 24};
+    SDL_SetTextInputArea(a->window, &area, 0);
+    SDL_StartTextInput(a->window);
+    SDL_HideCursor();
+    return text_preview(a);
+}
+static bool text_commit(App *a) {
+    bool ok = true;
+    if (a->text_len) {
+        if (!ensure_ink_layer(a))
+            return false;
+        Path path = {0};
+        ok = text_path(a->font, a->text, TEXT_SIZE, a->text_origin, &path, NULL) &&
+             canvas_fill(&a->ink_canvas, &path, TEXT_RGB, false);
+        path_free(&path);
+        if (!ok)
+            SDL_SetError("Cannot draw text");
+        a->ink_dirty = true;
+    }
+    text_stop(a);
+    return ok;
+}
+static bool text_insert(App *a, const char *s) {
+    if (a->text_len + strlen(s) >= sizeof(a->text))
+        return true;
+    for (; *s; s++) {
+        unsigned char ch = (unsigned char)*s;
+        if ((ch >= 0x20 && ch != 0x7f) || ch == '\n')
+            a->text[a->text_len++] = (char)ch;
+    }
+    a->text[a->text_len] = 0;
+    return text_preview(a);
+}
+static bool text_key(App *a, const SDL_KeyboardEvent *k) {
+    a->swallow_t = false;
+    switch (k->key) {
+    case SDLK_ESCAPE:
+        if (!k->repeat)
+            text_stop(a);
+        return true;
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:
+        if (k->mod & SDL_KMOD_SHIFT)
+            return text_insert(a, "\n");
+        return k->repeat || text_commit(a);
+    case SDLK_BACKSPACE:
+        if (!a->text_len)
+            return true;
+        do /* Remove one whole UTF-8 sequence. */
+            a->text_len--;
+        while (a->text_len && ((unsigned char)a->text[a->text_len] & 0xc0) == 0x80);
+        a->text[a->text_len] = 0;
+        return text_preview(a);
+    default:
+        return true; /* Other keys only type text, never navigate. */
+    }
 }
 static void tick_animations(App *a, uint64_t now) {
     for (int i = 0; i < a->playback_count; i++)
@@ -213,6 +381,7 @@ static bool rebuild(App *a) {
     }
     a->down = a->drawing = false;
     SDL_CaptureMouse(false);
+    text_stop(a); /* Pending text belongs to the discarded page geometry. */
     if (!pdf_render_background(a->pdf, a->page, &a->canvas, &a->view)) {
         SDL_SetError("Page %d: %s", a->page + 1, pdf_error(a->pdf));
         return false;
@@ -250,6 +419,16 @@ static bool present(App *a) {
     }
     if (a->ink_texture && !SDL_RenderTexture(a->renderer, a->ink_texture, NULL, NULL))
         return false;
+    if (a->typing) {
+        if (a->text_texture &&
+            !SDL_RenderTexture(a->renderer, a->text_texture, NULL, &a->text_rect))
+            return false;
+        if (!SDL_SetRenderDrawBlendMode(a->renderer, SDL_BLENDMODE_BLEND) ||
+            !SDL_SetRenderDrawColor(a->renderer, (TEXT_RGB >> 16) & 255, (TEXT_RGB >> 8) & 255,
+                                    TEXT_RGB & 255, 255) ||
+            !SDL_RenderFillRect(a->renderer, &a->caret))
+            return false;
+    }
     for (int i = 0; i < a->playback_count; i++)
         if (!draw_control(a, &a->playbacks[i]))
             return false;
@@ -310,6 +489,8 @@ static bool event(App *a, SDL_Event *e) {
         a->texture = NULL;
         SDL_DestroyTexture(a->ink_texture);
         a->ink_texture = NULL;
+        SDL_DestroyTexture(a->text_texture);
+        a->text_texture = NULL;
         for (int i = 0; i < a->playback_count; i++) {
             SDL_DestroyTexture(a->playbacks[i].texture);
             a->playbacks[i].texture = NULL;
@@ -324,6 +505,8 @@ static bool event(App *a, SDL_Event *e) {
         SDL_CaptureMouse(false);
         break;
     case SDL_EVENT_KEY_DOWN:
+        if (a->typing)
+            return text_key(a, &e->key);
         if (e->key.repeat)
             break;
         switch (e->key.key) {
@@ -351,6 +534,10 @@ static bool event(App *a, SDL_Event *e) {
         case SDLK_END:
             change_page(a, pdf_page_count(a->pdf) - 1);
             break;
+        case SDLK_T:
+            if (!a->refresh && !text_start(a))
+                return false;
+            break;
         case SDLK_C:
         case SDLK_DELETE:
             a->refresh = true;
@@ -365,6 +552,16 @@ static bool event(App *a, SDL_Event *e) {
             break;
         }
         break;
+    case SDL_EVENT_TEXT_INPUT:
+        if (!a->typing)
+            break;
+        if (a->swallow_t) {
+            a->swallow_t = false;
+            if (!strcmp(e->text.text, "t") || !strcmp(e->text.text, "T"))
+                break;
+        }
+        SDL_HideCursor();
+        return text_insert(a, e->text.text);
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         if (a->refresh || a->down ||
             (e->button.button != SDL_BUTTON_LEFT && e->button.button != SDL_BUTTON_RIGHT))
@@ -376,6 +573,8 @@ static bool event(App *a, SDL_Event *e) {
         SDL_CaptureMouse(true);
         break;
     case SDL_EVENT_MOUSE_MOTION: {
+        if (a->typing)
+            SDL_ShowCursor();
         if (a->refresh)
             break;
         Point p = position(a, e->motion.x, e->motion.y);
@@ -467,7 +666,7 @@ done:
 #ifndef SDL_PDF_VIEWER_NO_MAIN
 int main(int argc, char **argv) {
     bool windowed = false, check = false;
-    const char *path = NULL, *output = NULL;
+    const char *path = NULL, *output = NULL, *font_path = NULL;
     int render_page = 0;
     double fps_override = 0;
     for (int i = 1; i < argc; i++) {
@@ -481,7 +680,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Invalid --fps (expected 0.1 to 240)\n");
                 return 2;
             }
-        } else if (!strcmp(argv[i], "--check"))
+        } else if (!strcmp(argv[i], "--font") && i + 1 < argc)
+            font_path = argv[++i];
+        else if (!strcmp(argv[i], "--check"))
             check = true;
         else if (!strcmp(argv[i], "--render") && i + 1 < argc)
             output = argv[++i];
@@ -498,16 +699,16 @@ int main(int argc, char **argv) {
         else {
             fprintf(stderr,
                     "Usage: %s [--windowed|--check|--render output.ppm] [--page N] [--fps N] "
-                    "file.pdf\n",
+                    "[--font file.ttf] file.pdf\n",
                     argv[0]);
             return 2;
         }
     }
     if (!path) {
-        fprintf(
-            stderr,
-            "Usage: %s [--windowed|--check|--render output.ppm] [--page N] [--fps N] file.pdf\n",
-            argv[0]);
+        fprintf(stderr,
+                "Usage: %s [--windowed|--check|--render output.ppm] [--page N] [--fps N] "
+                "[--font file.ttf] file.pdf\n",
+                argv[0]);
         return 2;
     }
     char error[256];
@@ -543,6 +744,11 @@ int main(int argc, char **argv) {
     }
     App a = {0};
     a.pdf = pdf;
+    if (font_path && !(a.font = text_font_load(font_path))) {
+        fprintf(stderr, "Font: cannot load TrueType font %s\n", font_path);
+        pdf_close(pdf);
+        return 1;
+    }
     a.fps_override = fps_override;
     a.running = true;
     a.refresh = true;
@@ -604,6 +810,8 @@ done:
                                      a.window);
     }
     free_playbacks(&a);
+    SDL_DestroyTexture(a.text_texture);
+    text_font_free(a.font);
     brush_free(&a.brush);
     canvas_free(&a.ink_canvas);
     SDL_DestroyTexture(a.ink_texture);

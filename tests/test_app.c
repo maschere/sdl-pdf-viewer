@@ -1,6 +1,7 @@
 /* Exercise the actual application event handlers using SDL's dummy driver. */
 #define SDL_PDF_VIEWER_NO_MAIN
 #include "../src/main.c"
+#include "ttf_fixture.h"
 #define CHECK(x)                                                                                   \
     do {                                                                                           \
         if (!(x)) {                                                                                \
@@ -19,6 +20,19 @@ static void mouse(App *a, Uint32 type, float x, float y) {
         e.button.y = y;
         e.button.button = SDL_BUTTON_LEFT;
     }
+    CHECK(event(a, &e));
+}
+static void type(App *a, const char *text) {
+    SDL_Event e = {0};
+    e.type = SDL_EVENT_TEXT_INPUT;
+    e.text.text = text;
+    CHECK(event(a, &e));
+}
+static void press(App *a, SDL_Keycode key, SDL_Keymod mod) {
+    SDL_Event e = {0};
+    e.type = SDL_EVENT_KEY_DOWN;
+    e.key.key = key;
+    e.key.mod = mod;
     CHECK(event(a, &e));
 }
 int main(int argc, char **argv) {
@@ -67,6 +81,58 @@ int main(int argc, char **argv) {
     key.key.key = SDLK_C;
     CHECK(event(&a, &key));
     CHECK(rebuild(&a));
+    /* T starts dark blue text at the pointer; typing never navigates. */
+    static uint8_t font[2048];
+    size_t font_size = ttf_fixture(font, sizeof(font));
+    a.font = text_font_from_memory(font, font_size);
+    CHECK(a.font);
+    SDL_WarpMouseInWindow(a.window, 120, 150);
+    float mx = 0, my = 0;
+    SDL_GetMouseState(&mx, &my);
+    press(&a, SDLK_T, 0);
+    CHECK(a.typing && a.text_len == 0);
+    Point o = a.text_origin;
+    CHECK(o.x == round(mx) && o.y == round(my + text_metrics(a.font, TEXT_SIZE).cap_height / 2));
+    type(&a, "t"); /* The T key's own character is not inserted. */
+    type(&a, "H");
+    press(&a, SDLK_N, 0);
+    press(&a, SDLK_C, 0);
+    press(&a, SDLK_SPACE, 0);
+    CHECK(a.page == 0 && !a.refresh && a.typing);
+    type(&a, "t");
+    CHECK(!strcmp(a.text, "Ht"));
+    press(&a, SDLK_BACKSPACE, 0);
+    type(&a, "\xc3\xa9"); /* Backspace removes a whole UTF-8 sequence. */
+    CHECK(a.text_len == 3);
+    press(&a, SDLK_BACKSPACE, 0);
+    CHECK(!strcmp(a.text, "H"));
+    press(&a, SDLK_RETURN, SDL_KMOD_LSHIFT);
+    type(&a, "H");
+    CHECK(!strcmp(a.text, "H\nH") && a.text_texture && present(&a));
+    /* At 18 px the fixture's H square spans 1.8..10.8 px right of the origin
+     * and 13 hinted pixels above the baseline. */
+    size_t first = ((size_t)(o.y - 5) * a.canvas.w + (size_t)(o.x + 5)) * 4;
+    size_t second = first + (size_t)text_metrics(a.font, TEXT_SIZE).line_height * a.canvas.w * 4;
+    a.running = true;
+    press(&a, SDLK_ESCAPE, 0); /* Cancels the text instead of quitting. */
+    CHECK(!a.typing && a.running && !a.text_texture && a.text_len == 0);
+    CHECK(a.ink_canvas.pixels[first + 3] == 0 && a.ink_canvas.pixels[second + 3] == 0);
+    press(&a, SDLK_T, 0);
+    type(&a, "H");
+    press(&a, SDLK_RETURN, SDL_KMOD_RSHIFT);
+    type(&a, "H");
+    press(&a, SDLK_RETURN, 0);
+    CHECK(!a.typing && a.ink_dirty);
+    for (int i = 0; i < 2; i++) {
+        const uint8_t *px = a.ink_canvas.pixels + (i ? second : first);
+        CHECK(px[0] == 0x0f && px[1] == 0x2f && px[2] == 0x8f && px[3] == 255);
+    }
+    CHECK(present(&a));
+    /* Committed text is ink: C clears it together with pen strokes. */
+    key.key.key = SDLK_C;
+    CHECK(event(&a, &key));
+    CHECK(rebuild(&a));
+    CHECK(a.ink_canvas.pixels[first + 3] == 0 && a.ink_canvas.pixels[second + 3] == 0);
     /* A tap on the PDF link goes to the rotated second page. */
     mouse(&a, SDL_EVENT_MOUSE_BUTTON_DOWN, 300, 90);
     mouse(&a, SDL_EVENT_MOUSE_BUTTON_UP, 300, 90);
@@ -92,6 +158,8 @@ int main(int argc, char **argv) {
     CHECK(event(&a, &key));
     CHECK(!a.running);
     free_playbacks(&a);
+    SDL_DestroyTexture(a.text_texture);
+    text_font_free(a.font);
     brush_free(&a.brush);
     canvas_free(&a.ink_canvas);
     SDL_DestroyTexture(a.ink_texture);
@@ -103,7 +171,7 @@ int main(int argc, char **argv) {
     SDL_DestroyWindow(a.window);
     SDL_Quit();
     pdf_close(a.pdf);
-    puts("SDL coordinate conversion, smooth ink, clear, link clicks and keyboard navigation "
-         "passed.");
+    puts("SDL coordinate conversion, smooth ink, text, clear, link clicks and keyboard "
+         "navigation passed.");
     return 0;
 }
