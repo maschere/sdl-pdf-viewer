@@ -255,7 +255,8 @@ static bool text_commit(App *a) {
     return ok;
 }
 static bool text_insert(App *a, const char *s) {
-    if (a->text_len + strlen(s) >= sizeof(a->text))
+    size_t old = a->text_len;
+    if (old + strlen(s) >= sizeof(a->text))
         return true;
     for (; *s; s++) {
         unsigned char ch = (unsigned char)*s;
@@ -263,6 +264,12 @@ static bool text_insert(App *a, const char *s) {
             a->text[a->text_len++] = (char)ch;
     }
     a->text[a->text_len] = 0;
+    if (text_preview(a))
+        return true;
+    /* Text too long to lay out: drop this input but keep typing. */
+    SDL_Log("Text input ignored: %s", SDL_GetError());
+    a->text_len = old;
+    a->text[old] = 0;
     return text_preview(a);
 }
 static bool text_key(App *a, const SDL_KeyboardEvent *k) {
@@ -542,8 +549,8 @@ static bool event(App *a, SDL_Event *e) {
         case SDLK_END:
             change_page(a, pdf_page_count(a->pdf) - 1);
             break;
-        case SDLK_T:
-            if (!a->refresh && !text_start(a))
+        case SDLK_T: /* Not during a pen stroke, whose brush owns the ink pixels. */
+            if (!a->refresh && !a->down && !text_start(a))
                 return false;
             break;
         case SDLK_C:
@@ -749,6 +756,11 @@ int main(int argc, char **argv) {
         pdf_close(pdf);
         return r;
     }
+    if (render_page >= pdf_page_count(pdf)) {
+        fprintf(stderr, "Page out of range\n");
+        pdf_close(pdf);
+        return 2;
+    }
     App a = {0};
     a.pdf = pdf;
     if (font_path && !(a.font = text_font_load(font_path))) {
@@ -761,11 +773,6 @@ int main(int argc, char **argv) {
     a.refresh = true;
     a.page = render_page;
     int result = 1;
-    if (render_page >= pdf_page_count(pdf)) {
-        fprintf(stderr, "Page out of range\n");
-        pdf_close(pdf);
-        return 2;
-    }
     if (!SDL_Init(SDL_INIT_VIDEO))
         goto done;
     a.window = SDL_CreateWindow("SDL PDF Viewer", 1280, 800,
@@ -788,7 +795,9 @@ int main(int argc, char **argv) {
         if (a.refresh && !rebuild(&a))
             goto done;
         tick_animations(&a, SDL_GetTicksNS());
-        if (a.dirty && !present(&a))
+        /* A pending rebuild (e.g. a minimized window after a device reset)
+         * may have no display texture yet. */
+        if (a.dirty && !a.refresh && !present(&a))
             goto done;
         SDL_Event e;
         int wait = animation_wait(&a, SDL_GetTicksNS());

@@ -102,6 +102,15 @@ int main(int argc, char **argv) {
     size_t font_size = ttf_fixture(font, sizeof(font));
     a.font = text_font_from_memory(font, font_size);
     CHECK(a.font);
+    /* T is ignored while a pen stroke is in progress. */
+    mouse(&a, SDL_EVENT_MOUSE_BUTTON_DOWN, 100, 250);
+    mouse(&a, SDL_EVENT_MOUSE_MOTION, 140, 250);
+    press(&a, SDLK_T, 0);
+    CHECK(a.drawing && !a.typing);
+    mouse(&a, SDL_EVENT_MOUSE_BUTTON_UP, 140, 250);
+    key.key.key = SDLK_C;
+    CHECK(event(&a, &key));
+    CHECK(rebuild(&a));
     SDL_WarpMouseInWindow(a.window, 120, 150);
     float mx = 0, my = 0;
     SDL_GetMouseState(&mx, &my);

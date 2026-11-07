@@ -389,7 +389,7 @@ void canvas_image(Canvas *c, const uint8_t *rgba, int w, int h, Matrix m) {
             Point p = matrix_point(inv, (Point){x + .5, y + .5});
             if (p.x < 0 || p.x >= 1 || p.y < 0 || p.y >= 1)
                 continue;
-            int ix = (int)(p.x * w), iy = MIN(h - 1, (int)((1 - p.y) * h));
+            int ix = MIN(w - 1, (int)(p.x * w)), iy = MIN(h - 1, (int)((1 - p.y) * h));
             const uint8_t *s = rgba + ((size_t)iy * w + ix) * 4;
             canvas_paint(c, x, y, (uint32_t)s[0] << 16 | (uint32_t)s[1] << 8 | s[2], s[3]);
         }

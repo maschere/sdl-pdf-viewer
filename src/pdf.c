@@ -477,11 +477,16 @@ static Value *resolve(Pdf *d, Value *v) {
     o->state = 2;
     return o->value;
 }
-static Box box_value(Pdf *d, Value *v) {
+/* PDF rectangles may name any two opposite corners; normalize them. */
+static Box rect_value(Pdf *d, Value *v) {
     if (!v || v->kind != ARRAY || v->count != 4)
-        fail(d, "Invalid page box");
-    Box b = {num(d, item(d, v, 0)), num(d, item(d, v, 1)), num(d, item(d, v, 2)),
-             num(d, item(d, v, 3))};
+        fail(d, "Invalid PDF rectangle");
+    double x0 = num(d, item(d, v, 0)), y0 = num(d, item(d, v, 1)), x1 = num(d, item(d, v, 2)),
+           y1 = num(d, item(d, v, 3));
+    return (Box){MIN(x0, x1), MIN(y0, y1), MAX(x0, x1), MAX(y0, y1)};
+}
+static Box box_value(Pdf *d, Value *v) {
+    Box b = rect_value(d, v);
     if (b.x1 <= b.x0 || b.y1 <= b.y0)
         fail(d, "Empty page box");
     return b;
@@ -710,13 +715,7 @@ static void load_animations(Pdf *d, Page *page) {
             if (!animated)
                 continue;
         }
-        Value *rect = get(d, annot, "Rect");
-        if (!rect || rect->kind != ARRAY || rect->count != 4)
-            fail(d, "Missing animation rectangle");
-        Box anchor = {num(d, item(d, rect, 0)), num(d, item(d, rect, 1)), num(d, item(d, rect, 2)),
-                      num(d, item(d, rect, 3))};
-        if (anchor.x1 < anchor.x0 || anchor.y1 < anchor.y0)
-            fail(d, "Invalid animation rectangle");
+        Box anchor = rect_value(d, get(d, annot, "Rect"));
         if (explicit_box && (anchor.x1 <= anchor.x0 || anchor.y1 <= anchor.y0))
             fail(d, "SDLAnim requires a nonempty annotation rectangle");
         Value *name = get(d, fs, "UF");
@@ -2010,7 +2009,7 @@ bool pdf_link_at(Pdf *d, int page, Point point, PdfLink *link) {
         Value *flags = get(d, a, "F");
         if (flags && (integer(d, flags, 0, INT_MAX) & (1 | 2 | 32)))
             continue;
-        Box b = box_value(d, get(d, a, "Rect"));
+        Box b = rect_value(d, get(d, a, "Rect"));
         if (point.x < b.x0 || point.x > b.x1 || point.y < b.y0 || point.y > b.y1)
             continue;
         Value *dest = get(d, a, "Dest"), *action = get(d, a, "A");
@@ -2032,7 +2031,9 @@ bool pdf_link_at(Pdf *d, int page, Point point, PdfLink *link) {
                 }
             }
         }
-        return link->page >= 0 || link->url != NULL;
+        /* A link without a usable target does not hide links beneath it. */
+        if (link->page >= 0 || link->url != NULL)
+            return true;
     }
     return false;
 }

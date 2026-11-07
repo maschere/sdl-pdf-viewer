@@ -79,6 +79,17 @@ int main(int argc, char **argv) {
     rgb(&c, 10, 90, 255, 0, 0, 0);
     rgb(&c, 90, 10, 255, 255, 255, 0);
     pdf_close(d);
+    /* A reversed MediaBox and link Rect are normalized; a zero-area link and a
+     * link with a missing destination do not hide the link beneath them. */
+    d = open_fixture(root, "reversed-rects.pdf", true);
+    CHECK(pdf_render(d, 0, &c, &m));
+    rgb(&c, 50, 50, 0, 0, 255, 0);
+    rgb(&c, 5, 5, 255, 255, 255, 0);
+    CHECK(pdf_link_at(d, 0, (Point){70, 70}, &link) && !strcmp(link.url, "https://example.org/"));
+    CHECK(pdf_link_at(d, 0, (Point){30, 30}, &link) && !strcmp(link.url, "https://example.org/"));
+    CHECK(pdf_link_at(d, 0, (Point){60, 60}, &link) && link.page == 0 && !link.url);
+    CHECK(!pdf_link_at(d, 0, (Point){95, 95}, &link));
+    pdf_close(d);
     d = open_fixture(root, "compressed.pdf", true);
     CHECK(pdf_page_count(d) == 1);
     CHECK(pdf_render(d, 0, &c, &m));

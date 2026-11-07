@@ -93,6 +93,18 @@ objects = [
 ]
 write('demo.pdf',objects)
 
+# Rectangles may name any two opposite corners. Zero-area links and links whose
+# destination is missing must not hide the links beneath them.
+write('reversed-rects.pdf',[
+    b'<< /Type /Catalog /Pages 2 0 R >>',
+    b'<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [100 100 0 0] >>',
+    b'<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [5 0 R 6 0 R 7 0 R] >>',
+    stream(b'0 0 1 rg 10 10 80 80 re f'),
+    b'<< /Type /Annot /Subtype /Link /Rect [60 60 60 60] /Dest [3 0 R /Fit] >>',
+    b'<< /Type /Annot /Subtype /Link /Rect [40 40 20 20] /Dest /missing >>',
+    b'<< /Type /Annot /Subtype /Link /Rect [90 90 10 10] /A << /S /URI /URI (https://example.org/) >> >>',
+])
+
 def simple(name, content, extras=b''):
     write(name,[b'<< /Type /Catalog /Pages 2 0 R >>',b'<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 100 100] >>',b'<< /Type /Page /Parent 2 0 R /Contents 4 0 R '+extras+b' >>',stream(content)])
 

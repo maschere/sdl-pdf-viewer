@@ -20,7 +20,8 @@ void text_font_free(TextFont *f);
 TextMetrics text_metrics(const TextFont *f, double size);
 /* Appends the outlines of UTF-8 text to `out`. `origin` is the left end of
  * the first baseline (rounded to the pixel grid); '\n' starts a new line.
- * `caret`, if given, receives the baseline point after the last glyph. */
+ * `caret`, if given, receives the baseline point after the last glyph.
+ * Malformed glyphs are skipped; false means the path could not grow. */
 bool text_path(const TextFont *f, const char *utf8, double size, Point origin, Path *out,
                Point *caret);
 #endif

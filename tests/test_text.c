@@ -67,6 +67,45 @@ int main(int argc, char **argv) {
             text_font_free(t);
         }
     }
+    /* Corrupt glyphs are skipped: 'O' gets an instruction length past its data
+     * and 'B' becomes a composite of itself. The rest of the text renders. */
+    {
+        uint8_t bad[2048];
+        memcpy(bad, font, size);
+        size_t glyf = 0, loca = 0;
+        for (int i = 0, n = bad[4] << 8 | bad[5]; i < n; i++) {
+            const uint8_t *r = bad + 12 + 16 * i;
+            size_t at = (size_t)r[8] << 24 | (size_t)r[9] << 16 | (size_t)r[10] << 8 | r[11];
+            if (!memcmp(r, "glyf", 4))
+                glyf = at;
+            if (!memcmp(r, "loca", 4))
+                loca = at;
+        }
+        CHECK(glyf && loca);
+        size_t o = glyf + 2 * (size_t)(bad[loca + 4] << 8 | bad[loca + 5]);
+        size_t b = glyf + 2 * (size_t)(bad[loca + 6] << 8 | bad[loca + 7]);
+        bad[o + 12] = bad[o + 13] = 0xff;
+        bad[b + 12] = 0;
+        bad[b + 13] = 3;
+        TextFont *t = text_font_from_memory(bad, size);
+        CHECK(t);
+        draw(t, "HOBH", (Point){10, 30}, &caret);
+        CHECK(red(16, 22) == 0 && red(16 + 42, 22) == 0); /* First and last H. */
+        CHECK(red(16 + 14, 22) == 255 && red(16 + 28, 22) == 255);
+        text_font_free(t);
+    }
+    /* Text whose outline exceeds the path limit reports failure. */
+    {
+        size_t n = 60000;
+        char *many = malloc(n + 1);
+        CHECK(many);
+        memset(many, 'H', n);
+        many[n] = 0;
+        Path path = {0};
+        CHECK(!text_path(f, many, 20, (Point){10, 30}, &path, NULL));
+        path_free(&path);
+        free(many);
+    }
     CHECK(!text_font_from_memory((const uint8_t *)"not a font at all", 17));
     CHECK(!text_font_load("missing-font-file.ttf"));
     /* Optionally render with a system font when one is available. */

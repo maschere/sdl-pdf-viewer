@@ -5,11 +5,12 @@
 
 #define MAX_FONT_BYTES (64u << 20)
 #define MAX_COMPOSITE_DEPTH 8
+#define MAX_GLYPH_PARTS 256 /* Glyph records visited per glyph, across composites. */
 
 struct TextFont {
     uint8_t *data;
     size_t size;
-    uint32_t glyf, glyf_len, loca, loca_len, hmtx, hmtx_len, cmap, cmap_len, kern, kern_len;
+    uint32_t glyf, glyf_len, loca, loca_len, hmtx, hmtx_len, cmap, kern, kern_len;
     int units, loca_long, glyphs, hmetrics;
     int ascender, descender, line_gap, x_height, cap_height;
 };
@@ -297,8 +298,10 @@ TextMetrics text_metrics(const TextFont *f, double size) {
     Hint h = hint_init(f, size);
     double ascent = round(f->ascender * h.scale), descent = round(-f->descender * h.scale);
     double line = round((f->ascender - f->descender + f->line_gap) * h.scale);
-    return (TextMetrics){ascent, descent, fmax(1, line), round(hint_y(&h, f->cap_height)),
-                         round(hint_y(&h, f->x_height))};
+    /* Typical proportions when a font provides neither metrics nor H/x glyphs. */
+    double cap = f->cap_height > 0 ? round(hint_y(&h, f->cap_height)) : round(size * .7);
+    double x = f->x_height > 0 ? round(hint_y(&h, f->x_height)) : round(size * .5);
+    return (TextMetrics){ascent, descent, fmax(1, line), cap, x};
 }
 
 typedef struct {
@@ -306,6 +309,7 @@ typedef struct {
     const Hint *hint;
     Path *path;
     double x, baseline;
+    int *parts; /* Remaining outline budget for the current glyph. */
 } Emit;
 static Point emit_point(const Emit *e, Matrix m, double x, double y) {
     Point p = matrix_point(m, (Point){x, y});
@@ -318,6 +322,8 @@ static bool emit_quad(const Emit *e, Point control, Point end) {
 /* `at` and `end` are absolute offsets of one glyph's data. */
 static bool simple_glyph(const Emit *e, uint32_t at, uint32_t end, int contours, Matrix m) {
     const TextFont *f = e->font;
+    if (!contours)
+        return true;
     uint32_t p = at + 10 + 2 * (uint32_t)contours;
     if (p + 2 > end)
         return false;
@@ -411,6 +417,8 @@ static bool simple_glyph(const Emit *e, uint32_t at, uint32_t end, int contours,
 static bool glyph_outline(const Emit *e, int glyph, Matrix m, int depth) {
     const TextFont *f = e->font;
     uint32_t start, end;
+    if (--*e->parts < 0) /* Bounds composite fan-out, not just depth. */
+        return false;
     if (!glyph_range(f, glyph, &start, &end))
         return true; /* Empty glyph, such as a space. */
     int contours = s16(f, f->glyf + start);
@@ -484,6 +492,15 @@ static uint32_t utf8_next(const char **s) {
     *s = (const char *)p;
     return c > 0x10ffff || (c >= 0xd800 && c < 0xe000) ? 0xfffd : c;
 }
+/* Appends a finished glyph outline; fails only when `out` cannot grow. */
+static bool append_path(Path *out, const Path *glyph) {
+    for (size_t i = 0; i < glyph->count; i++) {
+        Edge g = glyph->edges[i];
+        if ((g.begin && !path_move(out, g.a)) || !path_line(out, g.b))
+            return false;
+    }
+    return true;
+}
 bool text_path(const TextFont *f, const char *utf8, double size, Point origin, Path *out,
                Point *caret) {
     if (!f || !utf8 || !out || !isfinite(size) || size <= 0 || size > 4096)
@@ -491,7 +508,9 @@ bool text_path(const TextFont *f, const char *utf8, double size, Point origin, P
     Hint hint = hint_init(f, size);
     TextMetrics metrics = text_metrics(f, size);
     double left = round(origin.x);
-    Emit e = {f, &hint, out, left, round(origin.y)};
+    Path glyph_path = {0};
+    int parts = 0;
+    Emit e = {f, &hint, &glyph_path, left, round(origin.y), &parts};
     int previous = -1;
     bool ok = true;
     while (ok && *utf8) {
@@ -507,10 +526,17 @@ bool text_path(const TextFont *f, const char *utf8, double size, Point origin, P
         int glyph = glyph_index(f, code);
         if (previous >= 0)
             e.x += kerning(f, previous, glyph) * hint.scale;
-        ok = glyph_outline(&e, glyph, (Matrix){1, 0, 0, 1, 0, 0}, 0);
+        /* Each glyph is outlined separately: a malformed glyph is skipped
+         * rather than failing the whole text or leaving a partial contour. */
+        glyph_path.count = 0;
+        glyph_path.started = false;
+        parts = MAX_GLYPH_PARTS;
+        if (glyph_outline(&e, glyph, (Matrix){1, 0, 0, 1, 0, 0}, 0))
+            ok = append_path(out, &glyph_path);
         e.x += advance(f, glyph) * hint.scale;
         previous = glyph;
     }
+    path_free(&glyph_path);
     if (caret)
         *caret = (Point){e.x, e.baseline};
     return ok;
