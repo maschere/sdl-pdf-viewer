@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>SDL PDF Viewer</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#34539C"/>
+      <stop offset="1" stop-color="#141F4A"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FF6A4D"/>
+      <stop offset="1" stop-color="#E0213F"/>
+    </linearGradient>
+  </defs>
+
+  <!-- App tile, inset to the macOS icon grid -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)"/>
+
+  <!-- Page shadow -->
+  <path fill="#0C1433" fill-opacity="0.35" d="M324 208H612L732 328V796a32 32 0 0 1-32 32H324a32 32 0 0 1-32-32V240a32 32 0 0 1 32-32Z"/>
+
+  <!-- Page with folded corner -->
+  <path fill="#FFFFFF" d="M324 190H612L732 310V778a32 32 0 0 1-32 32H324a32 32 0 0 1-32-32V222a32 32 0 0 1 32-32Z"/>
+  <path fill="#C5D0EA" d="M612 190L732 310H644a32 32 0 0 1-32-32Z"/>
+
+  <!-- Text lines -->
+  <g fill="#23356F">
+    <rect x="352" y="300" width="200" height="48" rx="24"/>
+    <rect x="352" y="400" width="320" height="32" rx="16" fill-opacity="0.55"/>
+    <rect x="352" y="466" width="320" height="32" rx="16" fill-opacity="0.55"/>
+    <rect x="352" y="532" width="230" height="32" rx="16" fill-opacity="0.55"/>
+  </g>
+
+  <!-- Hand-drawn ink stroke, the viewer's signature feature -->
+  <path fill="none" stroke="url(#ink)" stroke-width="56" stroke-linecap="round" stroke-linejoin="round" d="M222 716C322 626 408 778 512 694S702 604 806 652"/>
+</svg>

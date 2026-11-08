@@ -58,3 +58,4 @@ dkms.conf
 .tools/
 build/
 build-asan/
+.DS_Store

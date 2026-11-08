@@ -9,7 +9,28 @@ backends are upstream code and may use native implementation languages.
 
 ## Build on Apple silicon
 
-Install Xcode Command Line Tools if needed (`xcode-select --install`), then:
+Install Xcode Command Line Tools if needed (`xcode-select --install`). Dependencies
+come from [vcpkg](https://vcpkg.io), which installs the versions pinned in
+`vcpkg.json` during configure. Set up vcpkg once per machine:
+
+```sh
+brew install cmake ninja pkgconf
+git clone https://github.com/microsoft/vcpkg.git ~/Documents/GIT/vcpkg
+~/Documents/GIT/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+# Add this line to ~/.zshrc so every project can find vcpkg:
+export VCPKG_ROOT="$HOME/Documents/GIT/vcpkg"
+```
+
+Then build and test:
+
+```sh
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
+./build/sdl-pdf-viewer tests/fixtures/demo.pdf
+```
+
+To use Homebrew's libraries instead of vcpkg:
 
 ```sh
 brew install cmake jpeg-turbo zlib giflib libpng
@@ -18,16 +39,28 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$(brew --prefix jpeg-turbo);$(brew --prefix zlib)"
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
-./build/sdl-pdf-viewer tests/fixtures/demo.pdf
 ```
 
 CMake uses an installed SDL3 package (3.4 or newer) when it finds one, such as
 Homebrew's `sdl3` or vcpkg's `sdl3`. Otherwise it downloads the exact SDL
 **3.4.20** source archive, verifies its SHA-256 and links SDL statically.
 zlib, libjpeg/libjpeg-turbo, giflib and libpng are used only for stream and image
-decoding; the PDF renderer itself is application code. All are C libraries and
-must be installed first; they may be dynamically linked. This builds a
-command-line executable, not a signed/notarized `.app` bundle.
+decoding; the PDF renderer itself is application code. All are C libraries; vcpkg
+links them statically on macOS, while Homebrew's may be dynamically linked. This
+builds a command-line executable, not a signed/notarized `.app` bundle.
+
+### Open PDFs from Finder
+
+```sh
+./tools/install_macos_app.sh
+```
+
+This installs `~/Applications/SDL PDF Viewer.app`, so PDFs can be opened with
+right-click > Open With > SDL PDF Viewer. It does not change the default PDF app.
+The bundle is a small AppleScript wrapper holding a copy of the viewer, because
+Finder delivers files through Apple Events and the viewer reads them from its
+command line. Re-run the script after rebuilding. The icon is generated from
+`assets/sdl-pdf-viewer.svg`.
 
 ## Linux and Windows
 
@@ -42,11 +75,12 @@ ctest --test-dir build --output-on-failure
 ./build/sdl-pdf-viewer file.pdf
 ```
 
-On Windows, install Visual Studio's C compiler, CMake, and vcpkg, then install
-the dependencies including SDL3 with vcpkg and configure with its toolchain file:
+On Windows, install Visual Studio's C compiler, CMake, and vcpkg, and make sure
+your vcpkg clone is up to date (`git pull`) so it has the commit pinned in
+`vcpkg.json`. Configure with its toolchain file; vcpkg then installs the
+dependencies, including SDL3, automatically:
 
 ```sh
-vcpkg install sdl3:x64-windows libjpeg-turbo:x64-windows zlib:x64-windows giflib:x64-windows libpng:x64-windows
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64   -DCMAKE_TOOLCHAIN_FILE=F:/GIT/vcpkg/scripts/buildsystems/vcpkg.cmake   -DVCPKG_TARGET_TRIPLET=x64-windows
 cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure

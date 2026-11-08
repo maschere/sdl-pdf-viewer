@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "sdl-pdf-viewer",
+  "version": "1.0.0",
+  "builtin-baseline": "ec48c11eae9448c8c6e7739d93e06fa2433aa95f",
+  "dependencies": [
+    "giflib",
+    "libjpeg-turbo",
+    "libpng",
+    "sdl3",
+    "zlib"
+  ]
+}
