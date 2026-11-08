@@ -40,6 +40,7 @@ struct Cff {
     jmp_buf jump;
     char error[160];
     size_t total_commands;
+    bool frozen;
 };
 static void bad(Cff *f, const char *fmt, ...) {
     va_list a;
@@ -606,16 +607,22 @@ static void run(Machine *m, Bytes bytes, int depth) {
 }
 bool cff_outline(Cff *f, unsigned code, bool identity, Matrix transform, Path *out, char *error,
                  size_t cap) {
-    if (setjmp(f->jump)) {
-        snprintf(error, cap, "%s", f->error);
-        return false;
-    }
     unsigned gid =
         identity ? (code < 65536 ? f->cidmap[code] : 0) : (code < 256 ? f->encoding[code] : 0);
-    if (code && !gid)
-        bad(f, "CFF character has no matching glyph");
+    if (code && !gid) {
+        snprintf(error, cap, "CFF character has no matching glyph");
+        return false;
+    }
     Glyph *g = &f->glyphs[gid];
     if (!g->ready) {
+        if (f->frozen) {
+            snprintf(error, cap, "CFF glyph was not prepared before shared rendering");
+            return false;
+        }
+        if (setjmp(f->jump)) {
+            snprintf(error, cap, "%s", f->error);
+            return false;
+        }
         g->count = 0;
         Machine m = {0};
         m.f = f;
@@ -639,8 +646,11 @@ bool cff_outline(Cff *f, unsigned code, bool identity, Matrix transform, Path *o
                             matrix_point(matrix, c.c));
         else
             ok = path_close(out);
-        if (!ok)
-            bad(f, "Cannot rasterize CFF outline");
+        if (!ok) {
+            snprintf(error, cap, "Cannot rasterize CFF outline");
+            return false;
+        }
     }
     return true;
 }
+void cff_freeze(Cff *f) { f->frozen = true; }

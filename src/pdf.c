@@ -16,6 +16,8 @@
 #include <jpeglib.h>
 #define FILE_LIMIT (64u * 1024u * 1024u)
 #define MEMORY_LIMIT (256u * 1024u * 1024u)
+/* Decoded images kept for the whole session, so slides never decode twice. */
+#define IMAGE_CACHE_LIMIT (sizeof(size_t) > 4 ? (size_t)2048u * 1024u * 1024u : (size_t)256u * 1024u * 1024u)
 #define OBJECT_LIMIT 100000
 #define ARRAY_LIMIT 200000
 #define DEPTH_LIMIT 64
@@ -40,6 +42,7 @@ struct Value {
     size_t stream_len;
     unsigned char *decoded;
     size_t decoded_len;
+    unsigned char *rgba; /* Decoded image, owned by the document once cached. */
 };
 /* One bounded arena owns permanent objects; frame allocations roll back after rendering. */
 typedef struct Allocation {
@@ -56,15 +59,14 @@ typedef struct {
 typedef struct {
     PdfAnimation info;
     Box anchor;
-    bool legacy;
+    bool legacy, placed;
 } AttachedAnimation;
 typedef struct {
     Value *object, *resources;
     Box box;
     int rotate;
     AttachedAnimation *animations;
-    int animation_count, placeholder_count;
-    Box *placeholders;
+    int animation_count;
 } Page;
 typedef struct PdfFont {
     Cff *cff;           /* Exactly one of cff, truetype and type1 is set. */
@@ -94,6 +96,11 @@ struct Pdf {
     Path path_stack[32];
     int path_depth;
     size_t animation_memory;
+    ImageScaler scaler;   /* Working buffers kept between images. */
+    Box placeholders[64]; /* Candidate animation boxes of the page being rendered. */
+    int placeholder_count;
+    size_t image_cache_bytes;
+    bool image_cache_closed;
 };
 typedef struct {
     Pdf *d;
@@ -682,7 +689,6 @@ static void load_animations(Pdf *d, Page *page) {
     if (count > 64)
         fail(d, "Too many attachments on one page");
     page->animations = alloc(d, count * sizeof(*page->animations));
-    page->placeholders = alloc(d, 64 * sizeof(*page->placeholders));
     for (size_t i = 0; i < annots->count; i++) {
         Value *annot = item(d, annots, i);
         if (!named(get(d, annot, "Subtype"), "FileAttachment"))
@@ -1045,6 +1051,7 @@ void pdf_close(Pdf *d) {
     if (!d)
         return;
     path_free(&d->work);
+    image_scaler_free(&d->scaler);
     for (PdfFont *f = d->fonts; f; f = f->next) {
         cff_close(f->cff);
         text_font_free(f->truetype);
@@ -1053,10 +1060,40 @@ void pdf_close(Pdf *d) {
     for (int i = 0; i < d->page_count; i++)
         for (int j = 0; j < d->pages[i].animation_count; j++)
             animation_free((Animation *)d->pages[i].animations[j].info.clip);
+    for (int i = 1; d->objects && i < d->object_count; i++)
+        if (d->objects[i].value)
+            free(d->objects[i].value->rgba);
     rollback(d, NULL);
     free(d->objects);
     free(d->file);
     free(d);
+}
+Pdf *pdf_worker_create(Pdf *d) {
+    Pdf *worker = malloc(sizeof(*worker));
+    if (!worker)
+        return NULL;
+    /* Nothing below this point writes to state the renderers share. */
+    d->image_cache_closed = true;
+    for (PdfFont *f = d->fonts; f; f = f->next)
+        if (f->cff)
+            cff_freeze(f->cff);
+    *worker = *d;
+    worker->allocs = NULL;
+    worker->memory = 0;
+    worker->work = (Path){0};
+    worker->scaler = (ImageScaler){0};
+    memset(worker->path_stack, 0, sizeof(worker->path_stack));
+    worker->path_depth = worker->placeholder_count = 0;
+    worker->error[0] = 0;
+    return worker;
+}
+void pdf_worker_free(Pdf *worker) {
+    if (!worker)
+        return;
+    path_free(&worker->work);
+    image_scaler_free(&worker->scaler);
+    rollback(worker, NULL);
+    free(worker);
 }
 int pdf_page_count(const Pdf *d) { return d->page_count; }
 const char *pdf_error(const Pdf *d) { return d->error; }
@@ -1150,6 +1187,8 @@ static unsigned char *image(Pdf *d, Value *v, int *width, int *height, int depth
         fail(d, "Image exceeds 16 million pixels");
     *width = w;
     *height = h;
+    if (v->rgba)
+        return v->rgba;
     Value *mask = get(d, v, "ImageMask");
     if (mask && mask->kind == WORD && !strcmp(mask->text, "true"))
         fail(d, "Stencil images unsupported");
@@ -1303,6 +1342,15 @@ static unsigned char *image(Pdf *d, Value *v, int *width, int *height, int depth
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
                 rgba[((size_t)y * w + x) * 4 + 3] = m[((size_t)(y * mh / h) * mw + x * mw / w) * 4];
+    }
+    size_t bytes = (size_t)w * h * 4;
+    if (!depth && !d->image_cache_closed && bytes <= IMAGE_CACHE_LIMIT - d->image_cache_bytes) {
+        v->rgba = malloc(bytes);
+        if (v->rgba) {
+            memcpy(v->rgba, rgba, bytes);
+            d->image_cache_bytes += bytes;
+            return v->rgba;
+        }
     }
     return rgba;
 }
@@ -1584,8 +1632,8 @@ static void shading(Pdf *d, Value *sh, Canvas *canvas, Graphics *g) {
             canvas_paint(canvas, x, y, lut[i], 255);
         }
 }
-static void remember_placeholder(Page *page, const Path *path, Matrix view) {
-    if (!page->animation_count || page->placeholder_count >= 64 || path->count != 4)
+static void remember_placeholder(Pdf *d, Page *page, const Path *path, Matrix view) {
+    if (!page->animation_count || d->placeholder_count >= 64 || path->count != 4)
         return;
     Matrix inverse;
     if (!matrix_inverse(view, &inverse))
@@ -1605,7 +1653,7 @@ static void remember_placeholder(Page *page, const Path *path, Matrix view) {
     if (w < 20 || h < 20 ||
         w * h > .7 * (page->box.x1 - page->box.x0) * (page->box.y1 - page->box.y0))
         return;
-    page->placeholders[page->placeholder_count++] = b;
+    d->placeholders[d->placeholder_count++] = b;
 }
 static void interpret(Pdf *d, Page *page, Canvas *canvas, const unsigned char *data, size_t size,
                       Matrix view, const Graphics *initial, int depth) {
@@ -1730,7 +1778,7 @@ static void interpret(Pdf *d, Page *page, Canvas *canvas, const unsigned char *d
             bool stroke = s[0] == 'S' || s[0] == 's' || s[0] == 'B' || s[0] == 'b';
             bool fill = s[0] == 'f' || s[0] == 'F' || s[0] == 'B' || s[0] == 'b';
             if (fill && rect_path && g.fill == 0 && g.fill_alpha == 1 && depth == 0)
-                remember_placeholder(page, path, view);
+                remember_placeholder(d, page, path, view);
             if (s[0] == 's' || s[0] == 'b')
                 require(d, path_close(path), "Invalid closepath");
             if (fill)
@@ -1775,7 +1823,7 @@ static void interpret(Pdf *d, Page *page, Canvas *canvas, const unsigned char *d
             else {
                 int w, h;
                 unsigned char *pixels = image(d, v, &w, &h, 0);
-                canvas_image_bicubic(canvas, pixels, w, h, g.ctm);
+                canvas_image_scaled(canvas, &d->scaler, pixels, w, h, g.ctm);
             }
         } else if (OP("gs", 1)) {
             require(d, args[0]->kind == NAME, "Invalid graphics state name");
@@ -1882,7 +1930,7 @@ static Matrix page_view(Page *p, int w, int h) {
 static void render_page(Pdf *d, int page, Canvas *canvas, Matrix *view) {
     require(d, page >= 0 && page < d->page_count, "Invalid page number");
     Page *p = &d->pages[page];
-    p->placeholder_count = 0;
+    d->placeholder_count = 0;
     *view = page_view(p, canvas->w, canvas->h);
     canvas->mask = canvas->softmask = NULL;
     canvas->opacity = 1;
@@ -1928,14 +1976,14 @@ static void place_animations(Pdf *d, Page *page, Canvas *canvas, Matrix view, bo
     for (int i = 0; i < page->animation_count; i++) {
         AttachedAnimation *attached = &page->animations[i];
         PdfAnimation *info = &attached->info;
-        if (attached->legacy) {
+        if (attached->legacy && !attached->placed) {
             double x = (attached->anchor.x0 + attached->anchor.x1) * .5;
             double y = (attached->anchor.y0 + attached->anchor.y1) * .5, best = 1e30;
             int candidate = -1;
-            for (int j = 0; j < page->placeholder_count; j++) {
+            for (int j = 0; j < d->placeholder_count; j++) {
                 if (used[j])
                     continue;
-                Box b = page->placeholders[j];
+                Box b = d->placeholders[j];
                 double dx = MAX(b.x0 - x, MAX(0, x - b.x1)), dy = MAX(b.y0 - y, MAX(0, y - b.y1));
                 double score =
                     dx * dx + dy * dy +
@@ -1948,8 +1996,9 @@ static void place_animations(Pdf *d, Page *page, Canvas *canvas, Matrix view, bo
             require(d, candidate >= 0,
                     "Cannot locate animation placeholder; use the provided \\pdfanimation command");
             used[candidate] = true;
-            info->box = page->placeholders[candidate];
+            info->box = d->placeholders[candidate];
             info->positioned = true;
+            attached->placed = true;
         }
         Box b = info->box;
         Point corners[4] = {{b.x0, b.y0}, {b.x1, b.y0}, {b.x1, b.y1}, {b.x0, b.y1}};

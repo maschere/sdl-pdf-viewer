@@ -147,6 +147,12 @@ avoid overlap seams. There is no resolution-dependent antialiasing cutoff or
 full-frame supersampling/downsampling pass. Pen updates touch only the narrow
 band around each curve segment.
 
+Page flips are instant in normal use: background threads keep the two pages on
+each side of the current one rendered and uploaded as textures, and pages are
+only rendered on demand when you jump further or flip faster than they finish.
+This holds about nine full-screen pages in RAM and VRAM. Decoded images are kept
+for the whole session, up to 2 GiB.
+
 ## In-place GIF and APNG animations
 
 Embedded GIF/APNG file attachments play directly within their reserved slide

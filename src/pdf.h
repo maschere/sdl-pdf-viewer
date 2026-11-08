@@ -27,4 +27,10 @@ const PdfAnimation *pdf_animation(const Pdf *pdf, int page, int index);
 /* Coordinates in the original PDF page coordinate system. */
 bool pdf_link_at(Pdf *pdf, int page, Point point, PdfLink *link);
 const char *pdf_error(const Pdf *pdf);
+/* A renderer for use on another thread: each thread needs its own, and may then
+ * render any page other threads are not rendering. Every page must have been
+ * rendered once beforehand, which prepares the shared fonts and animation
+ * placement; the document is read-only afterwards. Free workers before pdf_close. */
+Pdf *pdf_worker_create(Pdf *pdf);
+void pdf_worker_free(Pdf *worker);
 #endif

@@ -21,6 +21,16 @@ int main(int argc, char **argv) {
         pdf_close(pdf);
         return 2;
     }
+    /* Optional report of every page, to find the slow ones. The first pass
+     * includes image decoding, which the viewer does before showing anything. */
+    const char *passes = getenv("BENCHMARK_PER_PAGE");
+    for (int pass = 0; passes && pass < atoi(passes); pass++)
+        for (int i = 0; i < pdf_page_count(pdf); i++) {
+            clock_t begin = clock();
+            bool ok = pdf_render(pdf, i, &c, &view);
+            printf("pass %d page %d: %.1f ms%s\n", pass + 1, i + 1,
+                   1000. * (clock() - begin) / CLOCKS_PER_SEC, ok ? "" : " FAILED");
+        }
     clock_t start = clock();
     for (int i = 0; i < repeats; i++)
         if (!pdf_render(pdf, i % pdf_page_count(pdf), &c, &view)) {

@@ -37,18 +37,26 @@ void canvas_free(Canvas *c) {
     free(c->pixels);
     memset(c, 0, sizeof(*c));
 }
+/* An opaque pixel as stored in memory, whatever the byte order. Pixel buffers
+ * come from malloc, so they are suitably aligned for whole-pixel access. */
+static uint32_t opaque_word(uint32_t rgb) {
+    uint8_t bytes[4] = {(uint8_t)(rgb >> 16), (uint8_t)(rgb >> 8), (uint8_t)rgb, 255};
+    uint32_t word;
+    memcpy(&word, bytes, sizeof(word));
+    return word;
+}
+static void fill_pixels(uint8_t *pixels, size_t count, uint32_t word) {
+    uint32_t *out = (uint32_t *)(void *)pixels;
+    for (size_t i = 0; i < count; i++)
+        out[i] = word;
+}
 void canvas_clear(Canvas *c, uint32_t rgb) {
-    for (size_t i = 0; i < (size_t)c->w * c->h; i++) {
-        c->pixels[4 * i] = (uint8_t)(rgb >> 16);
-        c->pixels[4 * i + 1] = (uint8_t)(rgb >> 8);
-        c->pixels[4 * i + 2] = (uint8_t)rgb;
-        c->pixels[4 * i + 3] = 255;
-    }
+    fill_pixels(c->pixels, (size_t)c->w * c->h, opaque_word(rgb));
 }
 /* Geometry coverage has already been clipped by the scan converter. */
 static void composite(Canvas *c, int x, int y, uint32_t rgb, unsigned alpha) {
     size_t at = (size_t)y * c->w + x;
-    unsigned a = (unsigned)(alpha * MAX(0, MIN(1, c->opacity)) + .5);
+    unsigned a = c->opacity >= 1 ? alpha : (unsigned)(alpha * MAX(0, c->opacity) + .5);
     if (c->mask)
         a = (a * c->mask[at] + 127) / 255;
     if (c->softmask)
@@ -170,6 +178,52 @@ static void span_coverage(double *coverage, double *delta, double left, double r
         delta[b] -= weight;
     }
 }
+/* Pixels of one output row sharing a single coverage value. */
+typedef struct {
+    int x, count;
+    unsigned alpha;
+} CoverageRun;
+static void sort_hits(Hit *hits, size_t n) {
+    if (n > 32) {
+        qsort(hits, n, sizeof(*hits), hit_compare);
+        return;
+    }
+    for (size_t i = 1; i < n; i++) {
+        Hit h = hits[i];
+        size_t j = i;
+        for (; j > 0 && hits[j - 1].x > h.x; j--)
+            hits[j] = hits[j - 1];
+        hits[j] = h;
+    }
+}
+static size_t build_runs(CoverageRun *runs, const double *coverage, const double *delta, int x0,
+                         int x1) {
+    size_t n = 0;
+    double total = 0;
+    for (int x = x0; x < x1; x++) {
+        total += delta[x - x0];
+        unsigned alpha = (unsigned)(MAX(0, MIN(1, coverage[x - x0] + total)) * 255 + .5);
+        if (!alpha)
+            continue;
+        if (n && runs[n - 1].alpha == alpha && runs[n - 1].x + runs[n - 1].count == x)
+            runs[n - 1].count++;
+        else
+            runs[n++] = (CoverageRun){x, 1, alpha};
+    }
+    return n;
+}
+static void paint_runs(Canvas *c, int y, const CoverageRun *runs, size_t n, uint32_t rgb) {
+    bool plain = !c->mask && !c->softmask && c->opacity >= 1;
+    uint32_t word = opaque_word(rgb);
+    for (size_t i = 0; i < n; i++) {
+        CoverageRun r = runs[i];
+        if (plain && r.alpha == 255)
+            fill_pixels(c->pixels + ((size_t)y * c->w + r.x) * 4, (size_t)r.count, word);
+        else
+            for (int k = 0; k < r.count; k++)
+                composite(c, r.x + k, y, rgb, r.alpha);
+    }
+}
 bool canvas_fill(Canvas *c, const Path *p, uint32_t rgb, bool evenodd) {
     if (!p->count)
         return true;
@@ -188,16 +242,24 @@ bool canvas_fill(Canvas *c, const Path *p, uint32_t rgb, bool evenodd) {
     int x0 = bound(floor(left), c->w), x1 = bound(ceil(right), c->w);
     int y0 = bound(floor(top), c->h), y1 = bound(ceil(bottom), c->h);
     size_t capacity = p->count * 2;
-    ScanEdge *edges = malloc(capacity * sizeof(*edges));
-    ScanEdge **active = malloc(capacity * sizeof(*active));
-    Hit *hits = malloc(capacity * sizeof(*hits));
     size_t row_bytes = (size_t)(x1 - x0 + 1) * sizeof(double);
-    double *coverage = malloc(row_bytes), *delta = malloc(row_bytes);
-    if (!edges || !active || !hits || !coverage || !delta) {
-        free(edges); free(active); free(hits); free(coverage); free(delta);
+    /* One block, ordered so that every array is correctly aligned. */
+    size_t edge_bytes = capacity * sizeof(ScanEdge), hit_bytes = capacity * sizeof(Hit);
+    size_t active_bytes = capacity * sizeof(ScanEdge *);
+    size_t run_bytes = (size_t)(x1 - x0 + 1) * sizeof(CoverageRun);
+    unsigned char *block = malloc(edge_bytes + hit_bytes + 2 * row_bytes + active_bytes + run_bytes);
+    if (!block)
         return false;
-    }
-    size_t count = 0, next = 0, live = 0;
+    ScanEdge *edges = (ScanEdge *)(void *)block;
+    Hit *hits = (Hit *)(void *)(block + edge_bytes);
+    double *coverage = (double *)(void *)(block + edge_bytes + hit_bytes);
+    double *delta = (double *)(void *)((unsigned char *)coverage + row_bytes);
+    ScanEdge **active = (ScanEdge **)(void *)((unsigned char *)delta + row_bytes);
+    CoverageRun *runs = (CoverageRun *)(void *)((unsigned char *)active + active_bytes);
+    size_t count = 0, next = 0, live = 0, run_count = 0;
+    /* The runs also describe following rows crossed by the same vertical edges. */
+    bool row_repeats = false;
+    double repeat_end = 0;
     Point start = {0};
     for (size_t i = 0; i < p->count; i++) {
         Edge e = p->edges[i];
@@ -209,27 +271,39 @@ bool canvas_fill(Canvas *c, const Path *p, uint32_t rgb, bool evenodd) {
     }
     qsort(edges, count, sizeof(*edges), edge_compare);
     for (int y = y0; y < y1; y++) {
+        double ya = MAX(y, top), yb = MIN(y + 1., bottom);
+        bool full_row = ya == y && yb == y + 1.;
+        if (row_repeats && full_row && repeat_end >= y + 1. &&
+            (next == count || edges[next].y0 >= y + 1.)) {
+            paint_runs(c, y, runs, run_count, rgb);
+            continue;
+        }
         memset(coverage, 0, row_bytes);
         memset(delta, 0, row_bytes);
-        double ya = MAX(y, top), yb = MIN(y + 1., bottom);
         double weight = (yb - ya) / AA_SAMPLES;
+        bool changed = false;
         for (int sample = 0; sample < AA_SAMPLES; sample++) {
             double fy = ya + (sample + .5) * weight;
             size_t n = 0;
             for (size_t i = 0; i < live; i++)
                 if (active[i]->y1 > fy)
                     active[n++] = active[i];
+            if (sample && n != live)
+                changed = true;
             live = n;
             while (next < count && edges[next].y0 <= fy) {
-                if (edges[next].y1 > fy)
+                if (edges[next].y1 > fy) {
                     active[live++] = &edges[next];
+                    if (sample)
+                        changed = true;
+                }
                 next++;
             }
             for (size_t i = 0; i < live; i++) {
                 ScanEdge *e = active[i];
                 hits[i] = (Hit){e->x + (fy - e->y0) * e->slope, e->dir};
             }
-            qsort(hits, live, sizeof(*hits), hit_compare);
+            sort_hits(hits, live);
             int winding = 0;
             double begin = 0;
             for (size_t i = 0; i < live; i++) {
@@ -243,15 +317,16 @@ bool canvas_fill(Canvas *c, const Path *p, uint32_t rgb, bool evenodd) {
                                   MIN(hits[i].x, right) - x0, weight);
             }
         }
-        double total = 0;
-        for (int x = x0; x < x1; x++) {
-            total += delta[x - x0];
-            unsigned alpha = (unsigned)(MAX(0, MIN(1, coverage[x - x0] + total)) * 255 + .5);
-            if (alpha)
-                composite(c, x, y, rgb, alpha);
+        run_count = build_runs(runs, coverage, delta, x0, x1);
+        paint_runs(c, y, runs, run_count, rgb);
+        row_repeats = full_row && !changed;
+        repeat_end = bottom;
+        for (size_t i = 0; row_repeats && i < live; i++) {
+            row_repeats = active[i]->slope == 0;
+            repeat_end = MIN(repeat_end, active[i]->y1);
         }
     }
-    free(edges); free(active); free(hits); free(coverage); free(delta);
+    free(block);
     return true;
 }
 /* All pieces of a stroke have the same winding and are filled as one union.
@@ -401,6 +476,61 @@ bool canvas_stroke_pen(Canvas *c, const Path *p, uint32_t rgb, double width, int
     path_free(&local);
     return ok;
 }
+static bool all_opaque(const uint8_t *rgba, size_t pixels) {
+    for (size_t i = 0; i < pixels; i++)
+        if (rgba[i * 4 + 3] != 255)
+            return false;
+    return true;
+}
+/* canvas_image's sampling for an unrotated image: each output column reads one
+ * source column, so it is computed once rather than once per pixel. */
+static bool image_axis_aligned(Canvas *c, const uint8_t *rgba, int w, int h, Matrix inv, int xa,
+                               int xb, int ya, int yb) {
+    int *columns = malloc((size_t)(xb - xa) * sizeof(*columns));
+    if (!columns)
+        return false;
+    for (int x = xa; x < xb; x++) {
+        double u = inv.a * (x + .5) + inv.e;
+        bool visible = x + .5 >= c->clip.x0 && x + .5 < c->clip.x1 && u >= 0 && u < 1;
+        columns[x - xa] = visible ? MIN(w - 1, (int)(u * w)) : -1;
+    }
+    /* Columns fully inside the clip need no coverage computation. The visible
+     * columns form one interval, so trimming its ends leaves no gaps. */
+    int inner0 = MAX(xa, (int)ceil(c->clip.x0)), inner1 = MIN(xb, (int)floor(c->clip.x1));
+    while (inner0 < inner1 && columns[inner0 - xa] < 0)
+        inner0++;
+    while (inner0 < inner1 && columns[inner1 - 1 - xa] < 0)
+        inner1--;
+    bool contiguous = inner1 > inner0 && all_opaque(rgba, (size_t)w * h);
+    for (int x = inner0 + 1; contiguous && x < inner1; x++)
+        contiguous = columns[x - xa] == columns[x - 1 - xa] + 1;
+    uint32_t *out = (uint32_t *)(void *)c->pixels;
+    for (int y = ya; y < yb; y++) {
+        double v = inv.d * (y + .5) + inv.f;
+        if (y + .5 < c->clip.y0 || y + .5 >= c->clip.y1 || v < 0 || v >= 1)
+            continue;
+        const uint8_t *row = rgba + (size_t)MIN(h - 1, (int)((1 - v) * h)) * w * 4;
+        uint32_t *line = out + (size_t)y * c->w;
+        bool whole_row = y >= c->clip.y0 && y + 1 <= c->clip.y1;
+        for (int x = xa; x < xb; x++) {
+            if (whole_row && contiguous && x == inner0) {
+                memcpy(line + x, row + (size_t)columns[x - xa] * 4, (size_t)(inner1 - inner0) * 4);
+                x = inner1 - 1;
+                continue;
+            }
+            int column = columns[x - xa];
+            if (column < 0)
+                continue;
+            const uint8_t *s = row + (size_t)column * 4;
+            if (whole_row && x >= inner0 && x < inner1 && s[3] == 255)
+                memcpy(line + x, s, 4);
+            else
+                canvas_paint(c, x, y, (uint32_t)s[0] << 16 | (uint32_t)s[1] << 8 | s[2], s[3]);
+        }
+    }
+    free(columns);
+    return true;
+}
 void canvas_image(Canvas *c, const uint8_t *rgba, int w, int h, Matrix m) {
     Matrix inv;
     if (!matrix_inverse(m, &inv))
@@ -416,6 +546,9 @@ void canvas_image(Canvas *c, const uint8_t *rgba, int w, int h, Matrix m) {
     }
     int ya = bound(floor(MAX(y0, c->clip.y0)), c->h), yb = bound(ceil(MIN(y1, c->clip.y1)), c->h);
     int xa = bound(floor(MAX(x0, c->clip.x0)), c->w), xb = bound(ceil(MIN(x1, c->clip.x1)), c->w);
+    if (m.b == 0 && m.c == 0 && !c->mask && !c->softmask && c->opacity >= 1 && xb > xa &&
+        image_axis_aligned(c, rgba, w, h, inv, xa, xb, ya, yb))
+        return;
     for (int y = ya; y < yb; y++)
         for (int x = xa; x < xb; x++) {
             if (x + .5 < c->clip.x0 || x + .5 >= c->clip.x1 || y + .5 < c->clip.y0 ||
@@ -436,6 +569,11 @@ static double catmull_rom(double x) {
     return x < 1 ? 1 - 2.5 * x * x + 1.5 * x * x * x
            : x < 2 ? 2 - 4 * x + 2.5 * x * x - .5 * x * x * x
                    : 0;
+}
+static void filter_free(ImageFilter *f) {
+    free(f->spans);
+    free(f->weights);
+    memset(f, 0, sizeof(*f));
 }
 static bool filter_build(ImageFilter *f, int from, int to) {
     double scale = MAX(1, (double)from / to), support = 2 * scale;
@@ -463,14 +601,25 @@ static bool filter_build(ImageFilter *f, int from, int to) {
     return true;
 }
 void image_scaler_free(ImageScaler *s) {
-    free(s->x.spans);
-    free(s->x.weights);
-    free(s->y.spans);
-    free(s->y.weights);
+    filter_free(&s->x);
+    filter_free(&s->y);
     free(s->rows);
     free(s->line);
     free(s->pixels);
     memset(s, 0, sizeof(*s));
+}
+/* Grows a buffer without keeping its contents. Fresh pages are costly to touch,
+ * so a buffer never shrinks and serves later images of any size. */
+static bool reserve(void **buffer, size_t *capacity, size_t bytes) {
+    if (bytes <= *capacity)
+        return true;
+    free(*buffer);
+    *capacity = 0;
+    *buffer = malloc(bytes);
+    if (!*buffer)
+        return false;
+    *capacity = bytes;
+    return true;
 }
 static bool scale_size_valid(int w, int h) {
     return w >= 1 && h >= 1 && w <= SCALE_MAX_SIDE && h <= SCALE_MAX_SIDE &&
@@ -480,12 +629,17 @@ bool image_scale_bicubic(ImageScaler *s, const uint8_t *rgba, int sw, int sh, in
     if (!scale_size_valid(sw, sh) || !scale_size_valid(w, h) || (size_t)w * sh > SCALE_MAX_PIXELS)
         return false;
     if (s->w != w || s->h != h || s->source_w != sw || s->source_h != sh) {
-        image_scaler_free(s);
-        s->rows = malloc((size_t)w * sh * 4 * sizeof(*s->rows));
-        s->line = malloc((size_t)w * 4 * sizeof(*s->line));
-        s->pixels = malloc((size_t)w * h * 4);
-        if (!s->rows || !s->line || !s->pixels || !filter_build(&s->x, sw, w) ||
-            !filter_build(&s->y, sh, h)) {
+        filter_free(&s->x);
+        filter_free(&s->y);
+        s->w = s->h = s->source_w = s->source_h = 0;
+        void *rows = s->rows, *line = s->line, *pixels = s->pixels;
+        bool ok = reserve(&rows, &s->rows_capacity, (size_t)w * sh * 4 * sizeof(*s->rows)) &&
+                  reserve(&line, &s->line_capacity, (size_t)w * 4 * sizeof(*s->line)) &&
+                  reserve(&pixels, &s->pixels_capacity, (size_t)w * h * 4);
+        s->rows = rows;
+        s->line = line;
+        s->pixels = pixels;
+        if (!ok || !filter_build(&s->x, sw, w) || !filter_build(&s->y, sh, h)) {
             image_scaler_free(s);
             return false;
         }
@@ -494,6 +648,8 @@ bool image_scale_bicubic(ImageScaler *s, const uint8_t *rgba, int sw, int sh, in
         s->source_w = sw;
         s->source_h = sh;
     }
+    /* Most images have no transparency, so premultiplication can be skipped. */
+    bool opaque = all_opaque(rgba, (size_t)sw * sh);
     for (int y = 0; y < sh; y++) {
         const uint8_t *row = rgba + (size_t)y * sw * 4;
         float *o = s->rows + (size_t)y * w * 4;
@@ -501,9 +657,19 @@ bool image_scale_bicubic(ImageScaler *s, const uint8_t *rgba, int sw, int sh, in
             ImageFilterSpan span = s->x.spans[x];
             const float *weight = s->x.weights + (size_t)x * s->x.taps;
             float v[4] = {0};
+            if (opaque) {
+                for (int t = 0; t < span.count; t++) {
+                    const uint8_t *p = row + (size_t)(span.first + t) * 4;
+                    v[0] += p[0] * weight[t];
+                    v[1] += p[1] * weight[t];
+                    v[2] += p[2] * weight[t];
+                }
+                memcpy(o, v, sizeof(v));
+                continue;
+            }
             for (int t = 0; t < span.count; t++) {
                 const uint8_t *p = row + (size_t)(span.first + t) * 4;
-                float color = p[3] / 255.f * weight[t];
+                float color = p[3] * (1 / 255.f) * weight[t];
                 v[0] += p[0] * color;
                 v[1] += p[1] * color;
                 v[2] += p[2] * color;
@@ -522,9 +688,28 @@ bool image_scale_bicubic(ImageScaler *s, const uint8_t *rgba, int sw, int sh, in
                 s->line[i] += row[i] * weight[t];
         }
         uint8_t *o = s->pixels + (size_t)y * w * 4;
+        if (opaque) {
+            for (int x = 0; x < w; x++, o += 4) {
+                const float *v = s->line + (size_t)x * 4;
+                for (int k = 0; k < 3; k++) {
+                    int value = (int)(v[k] + .5f);
+                    o[k] = (uint8_t)(value < 0 ? 0 : value > 255 ? 255 : value);
+                }
+                o[3] = 255;
+            }
+            continue;
+        }
         for (int x = 0; x < w; x++, o += 4) {
             const float *v = s->line + (size_t)x * 4;
             double alpha = MAX(0, MIN(255, v[3]));
+            if (alpha >= 254.999) { /* Mostly opaque images need no division here. */
+                for (int k = 0; k < 3; k++) {
+                    int value = (int)(v[k] + .5f);
+                    o[k] = (uint8_t)(value < 0 ? 0 : value > 255 ? 255 : value);
+                }
+                o[3] = 255;
+                continue;
+            }
             for (int k = 0; k < 3; k++)
                 o[k] = alpha > 0 ? (uint8_t)(MAX(0, MIN(255, v[k] * 255 / alpha)) + .5) : 0;
             o[3] = (uint8_t)(alpha + .5);
@@ -532,7 +717,7 @@ bool image_scale_bicubic(ImageScaler *s, const uint8_t *rgba, int sw, int sh, in
     }
     return true;
 }
-void canvas_image_bicubic(Canvas *c, const uint8_t *rgba, int w, int h, Matrix m) {
+void canvas_image_scaled(Canvas *c, ImageScaler *s, const uint8_t *rgba, int w, int h, Matrix m) {
     /* Resample to the output size, within the scaler's limits, then place it
      * pixel for pixel. */
     double tw = MIN(SCALE_MAX_SIDE, ceil(hypot(m.a, m.b)));
@@ -544,10 +729,13 @@ void canvas_image_bicubic(Canvas *c, const uint8_t *rgba, int w, int h, Matrix m
     }
     if (tw * h > SCALE_MAX_PIXELS)
         tw = floor((double)SCALE_MAX_PIXELS / h);
-    ImageScaler s = {0};
     /* Failing only loses the smoothing, not the image. */
     bool scaled = tw >= 1 && th >= 1 && ((int)tw != w || (int)th != h) &&
-                  image_scale_bicubic(&s, rgba, w, h, (int)tw, (int)th);
-    canvas_image(c, scaled ? s.pixels : rgba, scaled ? s.w : w, scaled ? s.h : h, m);
+                  image_scale_bicubic(s, rgba, w, h, (int)tw, (int)th);
+    canvas_image(c, scaled ? s->pixels : rgba, scaled ? s->w : w, scaled ? s->h : h, m);
+}
+void canvas_image_bicubic(Canvas *c, const uint8_t *rgba, int w, int h, Matrix m) {
+    ImageScaler s = {0};
+    canvas_image_scaled(c, &s, rgba, w, h, m);
     image_scaler_free(&s);
 }

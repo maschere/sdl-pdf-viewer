@@ -16,6 +16,11 @@
 #define PEN_SCREEN_FRACTION .005 /* Pen, arrow and box width relative to the output height. */
 #define ARROW_HEAD 6             /* Arrowhead side length in pen diameters. */
 #define ARROW_ANGLE .49          /* Half-angle of the arrowhead (~28 degrees). */
+#define CACHE_RADIUS 2           /* Pages kept ready on each side of the current one. */
+#define CACHE_WORKERS 4          /* At most this many pages render in the background at once. */
+/* Every neighbor, plus any page a worker was still rendering when it fell out of
+ * range, plus the page being shown. */
+#define CACHE_SLOTS (2 * CACHE_RADIUS + CACHE_WORKERS + 1)
 
 typedef struct {
     const PdfAnimation *info;
@@ -26,7 +31,27 @@ typedef struct {
     SDL_FPoint origin, right, down;
     SDL_FRect control;
 } Playback;
+/* A rendered page and its texture, or a request for one. Workers only touch a
+ * QUEUED or RENDERING slot, and the main thread owns READY and FREE slots. All
+ * state changes hold cache_lock. */
+typedef enum { SLOT_FREE, SLOT_QUEUED, SLOT_RENDERING, SLOT_READY } SlotState;
 typedef struct {
+    SlotState state;
+    int page, priority;
+    bool discard, failed, uploaded;
+    bool stale; /* Being rendered for an output size no longer in use. */
+    Canvas canvas;
+    Matrix view;
+    SDL_Texture *texture;
+    char error[256];
+} PageSlot;
+struct App;
+typedef struct {
+    struct App *app;
+    Pdf *pdf;
+    SDL_Thread *thread;
+} CacheWorker;
+typedef struct App {
     Pdf *pdf;
     SDL_Window *window;
     SDL_Renderer *renderer;
@@ -57,6 +82,16 @@ typedef struct {
     SDL_Texture *text_texture;
     SDL_FRect text_rect, caret;
     double text_size; /* Em size in output pixels, fixed while typing. */
+    /* Background rendering of the neighboring pages. Without started workers,
+     * pages are rendered on demand in a->canvas. */
+    PageSlot slots[CACHE_SLOTS];
+    CacheWorker workers[CACHE_WORKERS];
+    int worker_count, direction, rendered_page;
+    bool have_page, ink_used, cache_quit;
+    SDL_Mutex *cache_lock;
+    SDL_Condition *cache_work, *cache_done;
+    Uint32 cache_event;
+    int cache_w, cache_h;
 } App;
 static void free_playbacks(App *a) {
     for (int i = 0; i < a->playback_count; i++) {
@@ -128,6 +163,8 @@ static bool ensure_ink_layer(App *a) {
         memset(a->ink_canvas.pixels, 0, (size_t)a->w * a->h * 4);
         a->ink_canvas.clip = a->canvas.clip;
     }
+    if (!a->ink_used)
+        a->ink_used = a->ink_dirty = true;
     if (!a->ink_texture) {
         a->ink_texture = SDL_CreateTexture(a->renderer, SDL_PIXELFORMAT_RGBA32,
                                            SDL_TEXTUREACCESS_STREAMING, a->w, a->h);
@@ -377,6 +414,272 @@ static bool draw_control(App *a, const Playback *p) {
                               {{r.x + r.w * .70f, r.y + r.h * .50f}, color, {0, 0}}};
     return SDL_RenderGeometry(a->renderer, NULL, vertices, 3, NULL, 0);
 }
+static int SDLCALL cache_worker(void *data) {
+    CacheWorker *self = data;
+    App *a = self->app;
+    SDL_LockMutex(a->cache_lock);
+    while (!a->cache_quit) {
+        PageSlot *job = NULL;
+        for (int i = 0; i < CACHE_SLOTS; i++)
+            if (a->slots[i].state == SLOT_QUEUED && (!job || a->slots[i].priority < job->priority))
+                job = &a->slots[i];
+        if (!job) {
+            SDL_WaitCondition(a->cache_work, a->cache_lock);
+            continue;
+        }
+        job->state = SLOT_RENDERING;
+        int page = job->page, w = a->cache_w, h = a->cache_h;
+        Canvas canvas = job->canvas; /* Exclusively this thread's until it is READY. */
+        SDL_UnlockMutex(a->cache_lock);
+        bool ok = true;
+        const char *message = "Cannot allocate page cache";
+        if (canvas.w != w || canvas.h != h || !canvas.pixels) {
+            canvas_free(&canvas);
+            ok = canvas_init(&canvas, w, h);
+        }
+        Matrix view = {0};
+        if (ok && !pdf_render_background(self->pdf, page, &canvas, &view)) {
+            ok = false;
+            message = pdf_error(self->pdf);
+        }
+        SDL_LockMutex(a->cache_lock);
+        job->canvas = canvas;
+        job->view = view;
+        job->uploaded = false;
+        if (job->discard || job->stale) {
+            job->discard = job->stale = false;
+            job->state = SLOT_FREE;
+        } else {
+            job->failed = !ok;
+            if (!ok)
+                SDL_strlcpy(job->error, message, sizeof(job->error));
+            job->state = SLOT_READY;
+            SDL_Event done = {.type = a->cache_event};
+            SDL_PushEvent(&done);
+        }
+        SDL_BroadcastCondition(a->cache_done);
+    }
+    SDL_UnlockMutex(a->cache_lock);
+    return 0;
+}
+static void cache_stop(App *a) {
+    if (a->cache_lock) {
+        SDL_LockMutex(a->cache_lock);
+        a->cache_quit = true;
+        SDL_BroadcastCondition(a->cache_work);
+        SDL_UnlockMutex(a->cache_lock);
+    }
+    for (int i = 0; i < a->worker_count; i++) {
+        SDL_WaitThread(a->workers[i].thread, NULL);
+        pdf_worker_free(a->workers[i].pdf);
+    }
+    a->worker_count = 0;
+    for (int i = 0; i < CACHE_SLOTS; i++) {
+        canvas_free(&a->slots[i].canvas);
+        SDL_DestroyTexture(a->slots[i].texture);
+        a->slots[i].texture = NULL;
+        a->slots[i].state = SLOT_FREE;
+    }
+    SDL_DestroyCondition(a->cache_work);
+    SDL_DestroyCondition(a->cache_done);
+    SDL_DestroyMutex(a->cache_lock);
+    a->cache_work = a->cache_done = NULL;
+    a->cache_lock = NULL;
+}
+/* Every page must already have been rendered once (see pdf_worker_create). If
+ * the workers cannot start, pages are simply rendered on demand. */
+static void cache_start(App *a) {
+    a->cache_event = SDL_RegisterEvents(1);
+    a->cache_lock = SDL_CreateMutex();
+    a->cache_work = SDL_CreateCondition();
+    a->cache_done = SDL_CreateCondition();
+    if (!a->cache_event || !a->cache_lock || !a->cache_work || !a->cache_done) {
+        cache_stop(a);
+        return;
+    }
+    int threads = SDL_clamp(SDL_GetNumLogicalCPUCores() - 1, 1, CACHE_WORKERS);
+    for (int i = 0; i < threads; i++) {
+        CacheWorker *worker = &a->workers[a->worker_count];
+        worker->app = a;
+        worker->pdf = pdf_worker_create(a->pdf);
+        if (!worker->pdf)
+            break;
+        worker->thread = SDL_CreateThread(cache_worker, "page-cache", worker);
+        if (!worker->thread) {
+            pdf_worker_free(worker->pdf);
+            break;
+        }
+        a->worker_count++;
+    }
+    if (!a->worker_count)
+        cache_stop(a);
+}
+/* Forgets every rendered page, for example because the output size changed. */
+static void cache_flush(App *a, int w, int h) {
+    SDL_LockMutex(a->cache_lock);
+    a->cache_w = w;
+    a->cache_h = h;
+    for (int i = 0; i < CACHE_SLOTS; i++) {
+        PageSlot *slot = &a->slots[i];
+        SDL_DestroyTexture(slot->texture);
+        slot->texture = NULL;
+        slot->uploaded = false;
+        if (slot->state == SLOT_RENDERING)
+            slot->stale = true;
+        else {
+            slot->state = SLOT_FREE;
+            canvas_free(&slot->canvas);
+        }
+    }
+    SDL_UnlockMutex(a->cache_lock);
+}
+static PageSlot *cache_find(App *a, int page) {
+    for (int i = 0; i < CACHE_SLOTS; i++)
+        if (a->slots[i].state != SLOT_FREE && !a->slots[i].stale && a->slots[i].page == page)
+            return &a->slots[i];
+    return NULL;
+}
+/* A free slot, or else the cached page farthest outside the window around `page`. */
+static PageSlot *cache_acquire(App *a, int page) {
+    PageSlot *best = NULL;
+    int distance = CACHE_RADIUS;
+    for (int i = 0; i < CACHE_SLOTS; i++) {
+        PageSlot *slot = &a->slots[i];
+        if (slot->state == SLOT_FREE)
+            return slot;
+        if (slot->state != SLOT_RENDERING && abs(slot->page - page) > distance) {
+            distance = abs(slot->page - page);
+            best = slot;
+        }
+    }
+    return best;
+}
+/* Keeps only the neighbors of the current page and requests the missing ones,
+ * nearest first, the pages in the direction of travel before the others. */
+static void cache_schedule(App *a) {
+    SDL_LockMutex(a->cache_lock);
+    for (int i = 0; i < CACHE_SLOTS; i++) {
+        PageSlot *slot = &a->slots[i];
+        if (slot->state == SLOT_FREE)
+            continue;
+        if (slot->page != a->page && abs(slot->page - a->page) <= CACHE_RADIUS)
+            continue;
+        if (slot->state == SLOT_RENDERING)
+            slot->discard = true;
+        else
+            slot->state = SLOT_FREE;
+    }
+    int first = a->direction < 0 ? -1 : 1, priority = 0;
+    for (int distance = 1; distance <= CACHE_RADIUS; distance++)
+        for (int side = 0; side < 2; side++, priority++) {
+            int page = a->page + (side ? -first : first) * distance;
+            if (page < 0 || page >= pdf_page_count(a->pdf))
+                continue;
+            PageSlot *slot = cache_find(a, page);
+            if (!slot) {
+                slot = cache_acquire(a, page);
+                if (!slot)
+                    continue;
+                slot->state = SLOT_QUEUED;
+                slot->page = page;
+                slot->failed = slot->uploaded = false;
+            }
+            slot->discard = false;
+            slot->priority = priority;
+        }
+    SDL_BroadcastCondition(a->cache_work);
+    SDL_UnlockMutex(a->cache_lock);
+}
+static SDL_Texture *page_texture_create(App *a) {
+    SDL_Texture *texture = SDL_CreateTexture(a->renderer, SDL_PIXELFORMAT_RGBA32,
+                                             SDL_TEXTUREACCESS_STREAMING, a->w, a->h);
+    if (texture && !SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_NONE)) {
+        SDL_DestroyTexture(texture);
+        return NULL;
+    }
+    return texture;
+}
+/* Moves a finished page into the GPU ahead of time; a failure only means the
+ * upload happens when the page is shown. */
+static void cache_upload_one(App *a) {
+    PageSlot *slot = NULL;
+    SDL_LockMutex(a->cache_lock);
+    for (int i = 0; i < CACHE_SLOTS; i++) {
+        PageSlot *s = &a->slots[i];
+        if (s->state == SLOT_READY && !s->failed && !s->uploaded &&
+            (!slot || s->priority < slot->priority))
+            slot = s;
+    }
+    SDL_UnlockMutex(a->cache_lock);
+    if (!slot || a->refresh)
+        return;
+    if (!slot->texture)
+        slot->texture = page_texture_create(a);
+    if (slot->texture && SDL_UpdateTexture(slot->texture, NULL, slot->canvas.pixels, a->w * 4))
+        slot->uploaded = true;
+}
+/* Brings the current page into a->canvas and a->texture from its slot, waiting
+ * for a worker that is already rendering it or else rendering it right here.
+ * The page being replaced moves into the slot, ready for going back. */
+static bool cache_show(App *a) {
+    bool render_here = false;
+    SDL_LockMutex(a->cache_lock);
+    PageSlot *slot = cache_find(a, a->page);
+    if (slot && slot->state == SLOT_RENDERING)
+        slot->discard = false;
+    while (slot && slot->state == SLOT_RENDERING)
+        SDL_WaitCondition(a->cache_done, a->cache_lock);
+    if (!slot)
+        slot = cache_acquire(a, a->page);
+    if (slot && slot->state != SLOT_READY) {
+        render_here = true;
+        slot->state = SLOT_RENDERING; /* Keeps the workers away from it. */
+    }
+    SDL_UnlockMutex(a->cache_lock);
+    if (!slot)
+        return SDL_SetError("Page cache exhausted");
+    if (render_here) {
+        bool ok = true;
+        if (slot->canvas.w != a->w || slot->canvas.h != a->h || !slot->canvas.pixels) {
+            canvas_free(&slot->canvas);
+            ok = canvas_init(&slot->canvas, a->w, a->h);
+        }
+        if (!ok || !pdf_render_background(a->pdf, a->page, &slot->canvas, &slot->view)) {
+            const char *message = ok ? pdf_error(a->pdf) : "Cannot allocate page cache";
+            SDL_LockMutex(a->cache_lock);
+            slot->state = SLOT_FREE;
+            SDL_UnlockMutex(a->cache_lock);
+            return SDL_SetError("Page %d: %s", a->page + 1, message);
+        }
+        slot->uploaded = false;
+        slot->failed = false;
+    }
+    if (slot->failed) {
+        SDL_LockMutex(a->cache_lock);
+        slot->state = SLOT_FREE;
+        SDL_UnlockMutex(a->cache_lock);
+        return SDL_SetError("Page %d: %s", a->page + 1, slot->error);
+    }
+    if (!slot->texture && !(slot->texture = page_texture_create(a)))
+        return false;
+    Canvas canvas = a->canvas;
+    SDL_Texture *texture = a->texture;
+    Matrix view = a->view;
+    bool shown = !a->page_dirty;
+    a->canvas = slot->canvas;
+    a->texture = slot->texture;
+    a->view = slot->view;
+    a->page_dirty = !slot->uploaded;
+    slot->canvas = canvas;
+    slot->texture = texture;
+    slot->view = view;
+    slot->uploaded = shown;
+    SDL_LockMutex(a->cache_lock);
+    slot->page = a->rendered_page;
+    slot->state = a->have_page ? SLOT_READY : SLOT_FREE;
+    SDL_UnlockMutex(a->cache_lock);
+    return true;
+}
 static bool rebuild(App *a) {
     int w, h;
     if (!SDL_GetRenderOutputSize(a->renderer, &w, &h))
@@ -391,37 +694,48 @@ static bool rebuild(App *a) {
         canvas_free(&a->ink_canvas);
         SDL_DestroyTexture(a->ink_texture);
         a->ink_texture = NULL;
+        a->ink_used = false;
+        a->have_page = false;
+        cache_flush(a, w, h);
         if (!canvas_init(&a->canvas, w, h)) {
             SDL_SetError("Display exceeds raster memory limit");
             return false;
         }
         a->w = w;
         a->h = h;
-        a->texture = SDL_CreateTexture(a->renderer, SDL_PIXELFORMAT_RGBA32,
-                                       SDL_TEXTUREACCESS_STREAMING, w, h);
+        a->texture = page_texture_create(a);
         if (!a->texture) {
             SDL_SetError("Cannot allocate display buffers");
             return false;
         }
-        if (!SDL_SetTextureBlendMode(a->texture, SDL_BLENDMODE_NONE))
-            return false;
     }
     a->down = a->drawing = false;
     SDL_CaptureMouse(false);
     text_stop(a); /* Pending text belongs to the discarded page geometry. */
-    if (!pdf_render_background(a->pdf, a->page, &a->canvas, &a->view)) {
-        SDL_SetError("Page %d: %s", a->page + 1, pdf_error(a->pdf));
-        return false;
+    if (!a->have_page || a->rendered_page != a->page) {
+        if (a->worker_count) {
+            if (!cache_show(a))
+                return false;
+        } else if (!pdf_render_background(a->pdf, a->page, &a->canvas, &a->view)) {
+            SDL_SetError("Page %d: %s", a->page + 1, pdf_error(a->pdf));
+            return false;
+        } else
+            a->page_dirty = true;
+        a->rendered_page = a->page;
+        a->have_page = true;
     }
-    if (a->ink_canvas.pixels) {
+    if (a->ink_used) {
         memset(a->ink_canvas.pixels, 0, (size_t)a->w * a->h * 4);
-        a->ink_canvas.clip = a->canvas.clip;
+        a->ink_used = false;
     }
+    if (a->ink_canvas.pixels)
+        a->ink_canvas.clip = a->canvas.clip;
     if (!setup_playbacks(a))
         return false;
-    a->page_dirty = a->ink_dirty = true;
     a->refresh = false;
     a->dirty = true;
+    if (a->worker_count)
+        cache_schedule(a);
     return true;
 }
 static bool present(App *a) {
@@ -444,7 +758,8 @@ static bool present(App *a) {
                                                                 &p->origin, &p->right, &p->down))
             return false;
     }
-    if (a->ink_texture && !SDL_RenderTexture(a->renderer, a->ink_texture, NULL, NULL))
+    if (a->ink_used && a->ink_texture &&
+        !SDL_RenderTexture(a->renderer, a->ink_texture, NULL, NULL))
         return false;
     if (a->typing) {
         if (a->text_texture &&
@@ -531,6 +846,7 @@ static void shape_draw(App *a, Point p) {
 static void change_page(App *a, int page) {
     if (page < 0 || page >= pdf_page_count(a->pdf) || page == a->page)
         return;
+    a->direction = page > a->page ? 1 : -1;
     a->page = page;
     a->refresh = true;
     a->down = a->drawing = false;
@@ -538,6 +854,10 @@ static void change_page(App *a, int page) {
     SDL_SetCursor(a->arrow);
 }
 static bool event(App *a, SDL_Event *e) {
+    if (a->cache_event && e->type == a->cache_event) {
+        cache_upload_one(a);
+        return true;
+    }
     switch (e->type) {
     case SDL_EVENT_QUIT:
         a->running = false;
@@ -846,6 +1166,7 @@ int main(int argc, char **argv) {
     if (!a.renderer)
         goto done;
     SDL_SetRenderVSync(a.renderer, 1);
+    cache_start(&a);
     a.arrow = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
     a.hand = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
     if (!a.arrow || !a.hand)
@@ -885,6 +1206,7 @@ done:
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "SDL PDF Viewer", SDL_GetError(),
                                      a.window);
     }
+    cache_stop(&a);
     free_playbacks(&a);
     SDL_DestroyTexture(a.text_texture);
     text_font_free(a.font);

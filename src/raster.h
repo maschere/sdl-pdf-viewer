@@ -61,13 +61,18 @@ typedef struct {
     ImageFilter x, y;
     float *rows, *line;
     uint8_t *pixels; /* The latest result: straight-alpha RGBA, w by h. */
+    size_t rows_capacity, line_capacity, pixels_capacity;
 } ImageScaler;
 /* Separable Catmull-Rom resampling of straight-alpha RGBA, filtered premultiplied.
- * Kernels and buffers are kept for repeated use at the same sizes, as for
- * animation frames. False when out of memory or beyond 16 million pixels. */
+ * Kernels are kept for repeated use at the same sizes, as for animation frames,
+ * and buffers for reuse at any size. False when out of memory or beyond 16
+ * million pixels. */
 bool image_scale_bicubic(ImageScaler *s, const uint8_t *rgba, int source_w, int source_h, int w,
                          int h);
 void image_scaler_free(ImageScaler *s);
+/* As canvas_image_bicubic, reusing the working buffers of `scaler`. */
+void canvas_image_scaled(Canvas *c, ImageScaler *scaler, const uint8_t *rgba, int w, int h,
+                         Matrix unit_to_canvas);
 void canvas_paint(Canvas *c, int x, int y, uint32_t rgb, unsigned alpha);
 void canvas_disk(Canvas *c, Point center, double radius, uint32_t rgb);
 #endif

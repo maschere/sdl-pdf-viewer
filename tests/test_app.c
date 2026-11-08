@@ -320,6 +320,37 @@ int main(int argc, char **argv) {
     CHECK(event(&a, &key));
     CHECK(a.page == 0);
     CHECK(rebuild(&a));
+    /* Pages from the background cache match pages rendered on demand. */
+    Canvas expected = {0};
+    Matrix expected_view;
+    CHECK(canvas_init(&expected, a.w, a.h));
+    for (int i = 0; i < pdf_page_count(a.pdf); i++)
+        CHECK(pdf_render(a.pdf, i, &expected, &expected_view));
+    cache_start(&a);
+    CHECK(a.worker_count > 0);
+    for (int i = 0; i < 40; i++) {
+        key.key.key = i % 3 == 2 ? SDLK_LEFT : SDLK_RIGHT;
+        CHECK(event(&a, &key));
+        if (a.refresh)
+            CHECK(rebuild(&a));
+        CHECK(pdf_render_background(a.pdf, a.page, &expected, &expected_view));
+        CHECK(!memcmp(a.canvas.pixels, expected.pixels, (size_t)a.w * a.h * 4));
+        CHECK(expected_view.e == a.view.e && expected_view.f == a.view.f);
+        CHECK(present(&a));
+        SDL_Event pending;
+        while (SDL_PollEvent(&pending))
+            CHECK(event(&a, &pending));
+    }
+    /* A resize drops everything that was rendered for the old size. */
+    CHECK(SDL_SetWindowSize(a.window, 500, 350));
+    CHECK(rebuild(&a) && a.canvas.w == 500);
+    canvas_free(&expected);
+    CHECK(canvas_init(&expected, a.w, a.h));
+    CHECK(pdf_render_background(a.pdf, a.page, &expected, &expected_view));
+    CHECK(!memcmp(a.canvas.pixels, expected.pixels, (size_t)a.w * a.h * 4));
+    CHECK(present(&a));
+    canvas_free(&expected);
+    cache_stop(&a);
     key.key.key = SDLK_ESCAPE;
     a.running = true;
     CHECK(event(&a, &key));

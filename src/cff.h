@@ -7,4 +7,7 @@ void cff_close(Cff *font);
 /* identity=true maps a CID through the charset; false uses CFF's built-in encoding. */
 bool cff_outline(Cff *font, unsigned code, bool identity, Matrix transform, Path *out, char *error,
                  size_t capacity);
+/* From here on cff_outline only reads the font, so it may run on several threads
+ * at once. A glyph that has not been outlined before now reports an error. */
+void cff_freeze(Cff *font);
 #endif
