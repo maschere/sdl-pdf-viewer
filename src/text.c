@@ -313,6 +313,8 @@ typedef struct {
 } Emit;
 static Point emit_point(const Emit *e, Matrix m, double x, double y) {
     Point p = matrix_point(m, (Point){x, y});
+    if (!e->hint) /* Unhinted: m already maps font units to the output. */
+        return p;
     return (Point){e->x + p.x * e->hint->scale, e->baseline - hint_y(e->hint, p.y)};
 }
 static bool emit_quad(const Emit *e, Point control, Point end) {
@@ -500,6 +502,18 @@ static bool append_path(Path *out, const Path *glyph) {
             return false;
     }
     return true;
+}
+bool text_glyph_path(const TextFont *f, uint32_t unicode, Matrix transform, Path *out) {
+    Path glyph = {0};
+    int parts = MAX_GLYPH_PARTS;
+    Emit e = {f, NULL, &glyph, 0, 0, &parts};
+    double unit = 1.0 / f->units;
+    Matrix m = matrix_mul(transform, (Matrix){unit, 0, 0, unit, 0, 0});
+    bool ok = true;
+    if (glyph_outline(&e, glyph_index(f, unicode), m, 0))
+        ok = append_path(out, &glyph);
+    path_free(&glyph);
+    return ok;
 }
 bool text_path(const TextFont *f, const char *utf8, double size, Point origin, Path *out,
                Point *caret) {

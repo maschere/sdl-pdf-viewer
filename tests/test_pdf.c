@@ -1,4 +1,5 @@
 #include "pdf.h"
+#include "ttf_fixture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,56 @@ static void rgb(Canvas *c, int x, int y, int r, int g, int b, int tolerance) {
                 g, b);
         exit(1);
     }
+}
+/* Writes a page showing 'H' then code 0x92 (WinAnsi U+2019, also a square in
+ * the fixture font) at 50pt. Only H has a PDF width, 1000 units, which differs
+ * from the 700 in the font's own hmtx so the test proves which one is used. */
+static void write_truetype_pdf(const char *path, const char *encoding) {
+    uint8_t font[2048];
+    size_t font_size = ttf_fixture(font, sizeof(font));
+    CHECK(font_size);
+    static const char content[] = "BT /F1 50 Tf 10 20 Td (H\\222) Tj ET";
+    char font_dict[256];
+    snprintf(font_dict, sizeof(font_dict),
+             "/Type /Font /Subtype /TrueType /BaseFont /Fixture /Encoding /%s "
+             "/FontDescriptor 6 0 R /FirstChar 72 /LastChar 72 /Widths [1000]",
+             encoding);
+    struct {
+        const char *dict;
+        const void *data;
+        size_t size;
+    } objects[] = {
+        {"/Type /Catalog /Pages 2 0 R", NULL, 0},
+        {"/Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 100 100]", NULL, 0},
+        {"/Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >>", NULL,
+         0},
+        {"", content, sizeof(content) - 1},
+        {font_dict, NULL, 0},
+        {"/Type /FontDescriptor /FontName /Fixture /Flags 32 /FontFile2 7 0 R", NULL, 0},
+        {"", font, font_size},
+    };
+    enum { COUNT = sizeof(objects) / sizeof(*objects) };
+    long offsets[COUNT];
+    FILE *f = fopen(path, "wb");
+    CHECK(f);
+    fputs("%PDF-1.4\n", f);
+    for (int i = 0; i < COUNT; i++) {
+        offsets[i] = ftell(f);
+        fprintf(f, "%d 0 obj\n<< %s", i + 1, objects[i].dict);
+        if (objects[i].data) {
+            fprintf(f, " /Length %zu >>\nstream\n", objects[i].size);
+            fwrite(objects[i].data, 1, objects[i].size, f);
+            fputs("\nendstream", f);
+        } else
+            fputs(" >>", f);
+        fputs("\nendobj\n", f);
+    }
+    long xref = ftell(f);
+    fprintf(f, "xref\n0 %d\n0000000000 65535 f \n", COUNT + 1);
+    for (int i = 0; i < COUNT; i++)
+        fprintf(f, "%010ld 00000 n \n", offsets[i]);
+    fprintf(f, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%ld\n%%%%EOF\n", COUNT + 1, xref);
+    CHECK(!fclose(f));
 }
 int main(int argc, char **argv) {
     CHECK(argc >= 2);
@@ -116,6 +167,32 @@ int main(int argc, char **argv) {
         canvas_free(&small);
         pdf_close(d);
     }
+    /* Each 20-pixel square has one edge drawn by a flex operator; a wrong flex
+     * end point shifts the far corner across these inside/outside samples. */
+    d = open_fixture(root, "cff-flex.pdf", true);
+    CHECK(pdf_render(d, 0, &c, &m));
+    const int horizontal_flex[][2] = {{27, 73}, {57, 73}, {87, 73}, {27, 23}};
+    for (int i = 0; i < 4; i++) {
+        rgb(&c, horizontal_flex[i][0], horizontal_flex[i][1], 0, 0, 0, 0);
+        rgb(&c, horizontal_flex[i][0], horizontal_flex[i][1] - 6, 255, 255, 255, 0);
+    }
+    rgb(&c, 57, 30, 0, 0, 0, 0); /* The vertical flex1 square. */
+    rgb(&c, 63, 30, 255, 255, 255, 0);
+    pdf_close(d);
+    /* Embedded TrueType, as in slides imported from Office-made PDFs: squares
+     * at x 15-40 and, after the 1000-unit PDF width, x 65-90. */
+    const char *truetype = "test_pdf_truetype.pdf";
+    write_truetype_pdf(truetype, "WinAnsiEncoding");
+    d = open_fixture(".", truetype, true);
+    CHECK(pdf_render(d, 0, &c, &m));
+    rgb(&c, 27, 60, 0, 0, 0, 0);
+    rgb(&c, 77, 60, 0, 0, 0, 0);
+    rgb(&c, 55, 60, 255, 255, 255, 0);
+    rgb(&c, 27, 30, 255, 255, 255, 0);
+    pdf_close(d);
+    write_truetype_pdf(truetype, "MacRomanEncoding");
+    open_fixture(".", truetype, false);
+    remove(truetype);
     d = open_fixture(root, "graphics.pdf", true);
     CHECK(pdf_render(d, 0, &c, &m));
     rgb(&c, 10, 90, 255, 127, 127, 1);

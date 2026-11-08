@@ -24,4 +24,7 @@ TextMetrics text_metrics(const TextFont *f, double size);
  * Malformed glyphs are skipped; false means the path could not grow. */
 bool text_path(const TextFont *f, const char *utf8, double size, Point origin, Path *out,
                Point *caret);
+/* Appends one unhinted glyph; `transform` maps em space (1 = the font size) to
+ * the output. A malformed glyph is skipped; false means the path could not grow. */
+bool text_glyph_path(const TextFont *f, uint32_t unicode, Matrix transform, Path *out);
 #endif

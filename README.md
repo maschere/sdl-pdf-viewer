@@ -209,7 +209,7 @@ CRC/sequence errors are rejected.
 | Transforms | Affine transforms for fills, glyphs, forms and images; uniform scale/rotation/reflection for strokes |
 | Colors | DeviceGray, DeviceRGB; interpolated default DeviceCMYK conversion for vector paint |
 | Graphics state | q/Q, widths, caps, joins, miter limit; rectangular and arbitrary path clipping |
-| Text | Embedded CFF Type 2 outlines; CIDFontType0/Identity-H and simple Type1C encodings; PDF widths, text matrices and TJ adjustments |
+| Text | Embedded CFF Type 2 outlines; CIDFontType0/Identity-H and simple Type1C encodings; simple TrueType fonts with WinAnsiEncoding and a Unicode cmap; PDF widths, text matrices and TJ adjustments |
 | Forms | Nested Form XObjects with resources, Matrix and BBox |
 | Gradients | Axial and concentric growing radial shadings; exponential and stitching functions |
 | Transparency | Constant fill/stroke alpha and luminosity Form soft masks |
@@ -233,12 +233,12 @@ appearance streams are not rendered. Non-navigation actions and additional actio
 chains are ignored. Links do not trigger JavaScript, file launch, embedded-file
 opening, or remote-PDF navigation.
 
-Unsupported features still include TrueType/OpenType font programs, Type 1
-eexec programs, non-Identity composite encodings, simple-font encoding overrides,
+Unsupported features still include composite (CIDFontType2), symbolic and
+non-WinAnsi TrueType fonts, OpenType font programs, Type 1 eexec programs, non-Identity composite encodings, simple-font encoding overrides,
 inline images, CMYK/ICC/Separation images, stencil/color-key masks, Matte images,
 non-normal blend modes, general transparency group isolation/knockout, arbitrary
 radial circle arrangements, dashed strokes, patterns, encryption, hybrid xrefs
-and incremental updates. Font clipping modes, CFF arithmetic/flex operators and
+and incremental updates. Font clipping modes, CFF arithmetic operators and
 some predefined font encodings are also outside the current subset. 
 
 Limits include 64 MiB input/decoded streams, 256 MiB PDF allocation budget,

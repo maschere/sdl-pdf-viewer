@@ -136,9 +136,9 @@ def cff_int(n):
 
 def cff_offset(n): return b'\x1d'+n.to_bytes(4,'big')
 
-def make_cff(cid=False):
+def make_cff(cid=False, glyph=None):
     # Glyph A: a filled triangular outline; fixed PDF widths control advances.
-    glyph = cff_int(100)+cff_int(0)+b'\x15'+cff_int(300)+cff_int(700)+cff_int(300)+cff_int(-700)+b'\x05\x0e'
+    glyph = glyph or cff_int(100)+cff_int(0)+b'\x15'+cff_int(300)+cff_int(700)+cff_int(300)+cff_int(-700)+b'\x05\x0e'
     chars = cff_index([b'\x0e',glyph])
     encoding = bytes([0,1,65])
     charset = b'\0'+(100 if cid else 34).to_bytes(2,'big')
@@ -162,6 +162,28 @@ for cid in [False,True]:
     else:
         objects += [b'<< /Type /Font /Subtype /Type1 /FontDescriptor 6 0 R /FirstChar 65 /LastChar 65 /Widths [800] >>',b'<< /Type /FontDescriptor /FontFile3 7 0 R >>',stream(make_cff(),b'/Subtype /Type1C')]
     write('cff-cid.pdf' if cid else 'cff-simple.pdf',objects)
+
+def make_flex_glyph():
+    # Five 200-unit squares, one edge of each drawn by a flex operator. A flex
+    # that ends in the wrong place visibly skews the rest of its square.
+    def nums(*values): return b''.join(cff_int(v) for v in values)
+    flexes = [
+        ((100,100), 34, (30,40,20,30,30,40,30), False),                       # hflex
+        ((400,100), 35, (30,5,40,15,30,0,30,0,40,-15,30,-5,50), False),       # flex
+        ((700,100), 36, (30,5,40,15,30,30,40,-10,30), False),                 # hflex1
+        ((100,600), 37, (30,5,40,15,30,0,30,0,40,-10,30), False),             # flex1, horizontal
+        ((400,600), 37, (5,30,15,40,0,30,0,30,-10,40,30), True),              # flex1, vertical
+    ]
+    out, at = b'', (0,0)
+    for (x,y), op, args, vertical in flexes:
+        out += nums(x-at[0], y-at[1])+b'\x15'+nums(*args)+b'\x0c'+bytes([op])
+        out += nums(200,0,0,-200) if vertical else nums(0,200,-200,0)
+        out += b'\x05'
+        at = (x+200,y) if vertical else (x,y+200)
+    return out+b'\x0e'
+
+write('cff-flex.pdf',[b'<< /Type /Catalog /Pages 2 0 R >>',b'<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 100 100] >>',b'<< /Type /Page /Parent 2 0 R /Resources << /Font << /F 5 0 R >> >> /Contents 4 0 R >>',
+  stream(b'BT /F 100 Tf 0 0 Td (A) Tj ET'),b'<< /Type /Font /Subtype /Type1 /FontDescriptor 6 0 R /FirstChar 65 /LastChar 65 /Widths [1000] >>',b'<< /Type /FontDescriptor /FontFile3 7 0 R >>',stream(make_cff(glyph=make_flex_glyph()),b'/Subtype /Type1C')])
 
 # Reusable form, constant alpha, stitched gradient and a luminosity soft mask.
 write('graphics.pdf',[

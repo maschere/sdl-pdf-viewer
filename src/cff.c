@@ -453,6 +453,34 @@ static void remove_width(Machine *m, unsigned expected) {
     }
     m->width = true;
 }
+/* The four flex operators each draw two curves; their flex depth is ignored,
+ * so a flex is always rendered as curves. */
+static void flex(Machine *m, unsigned op) {
+    const double *s = m->stack;
+    unsigned n = m->n;
+    double d[12]; /* dx1 dy1 ... dx6 dy6 */
+    if (op == 34 && n == 7) { /* hflex */
+        double t[12] = {s[0], 0, s[1], s[2], s[3], 0, s[4], 0, s[5], -s[2], s[6], 0};
+        memcpy(d, t, sizeof(d));
+    } else if (op == 35 && n == 13) { /* flex */
+        memcpy(d, s, sizeof(d));
+    } else if (op == 36 && n == 9) { /* hflex1 */
+        double t[12] = {s[0], s[1], s[2], s[3], s[4], 0, s[5], 0, s[6], s[7], s[8],
+                        -(s[1] + s[3] + s[7])};
+        memcpy(d, t, sizeof(d));
+    } else if (op == 37 && n == 11) { /* flex1: the last delta is on the longer axis. */
+        double dx = s[0] + s[2] + s[4] + s[6] + s[8], dy = s[1] + s[3] + s[5] + s[7] + s[9];
+        bool horizontal = fabs(dx) > fabs(dy);
+        memcpy(d, s, 10 * sizeof(double));
+        d[10] = horizontal ? s[10] : -dx;
+        d[11] = horizontal ? -dy : s[10];
+    } else if (op >= 34 && op <= 37)
+        bad(m->f, "Invalid CFF flex operands");
+    else
+        bad(m->f, "Unsupported Type 2 charstring operator 12 %u", op);
+    bezier(m, d[0], d[1], d[2], d[3], d[4], d[5]);
+    bezier(m, d[6], d[7], d[8], d[9], d[10], d[11]);
+}
 static int bias(Index i) { return i.count < 1240 ? 107 : i.count < 33900 ? 1131 : 32768; }
 static void run(Machine *m, Bytes bytes, int depth) {
     if (depth > 10)
@@ -567,6 +595,10 @@ static void run(Machine *m, Bytes bytes, int depth) {
                 i += n - i == 5 ? 5 : 4;
                 horizontal = !horizontal;
             }
+        } else if (c == 12) {
+            if (at >= bytes.size)
+                bad(m->f, "Truncated CFF escape operator");
+            flex(m, bytes.data[at++]);
         } else
             bad(m->f, "Unsupported Type 2 charstring operator %u", c);
         m->n = 0;

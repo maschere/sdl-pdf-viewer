@@ -1,6 +1,7 @@
 #include "pdf.h"
 #include "cff.h"
 #include "cmyk_table.h"
+#include "text.h"
 #include <ctype.h>
 #include <limits.h>
 #include <setjmp.h>
@@ -65,7 +66,8 @@ typedef struct {
     Box *placeholders;
 } Page;
 typedef struct PdfFont {
-    Cff *cff;
+    Cff *cff;           /* Exactly one of cff and truetype is set. */
+    TextFont *truetype; /* Simple font: character codes are WinAnsi. */
     Value *source;
     bool identity;
     double *widths;
@@ -743,27 +745,39 @@ static PdfFont *font_load(Pdf *d, Value *source) {
     if (d->fonts_frozen)
         fail(d, "Font resources were not prepared at document load");
     bool identity = named(get(d, source, "Subtype"), "Type0");
+    bool truetype = named(get(d, source, "Subtype"), "TrueType");
     Value *metrics = source;
     if (identity) {
         if (!named(get(d, source, "Encoding"), "Identity-H"))
             fail(d, "Only Identity-H composite fonts supported");
         metrics = item(d, get(d, source, "DescendantFonts"), 0);
-    } else if (!named(get(d, source, "Subtype"), "Type1"))
-        fail(d, "Expected an embedded CFF font");
-    Value *descriptor = get(d, metrics, "FontDescriptor"), *file = get(d, descriptor, "FontFile3");
+    } else if (!truetype && !named(get(d, source, "Subtype"), "Type1"))
+        fail(d, "Expected an embedded CFF or TrueType font");
+    Value *descriptor = get(d, metrics, "FontDescriptor");
+    Value *file = get(d, descriptor, truetype ? "FontFile2" : "FontFile3");
     if (!file || !file->decoded)
-        fail(d, "Font requires embedded CFF outlines");
-    if (!named(get(d, file, "Subtype"), "Type1C") &&
-        !named(get(d, file, "Subtype"), "CIDFontType0C"))
+        fail(d, truetype ? "Font requires embedded TrueType outlines"
+                         : "Font requires embedded CFF outlines");
+    if (truetype) {
+        if (!named(get(d, source, "Encoding"), "WinAnsiEncoding"))
+            fail(d, "Only WinAnsiEncoding simple TrueType fonts supported");
+    } else if (!named(get(d, file, "Subtype"), "Type1C") &&
+               !named(get(d, file, "Subtype"), "CIDFontType0C"))
         fail(d, "Unsupported embedded font format");
     PdfFont *font = alloc(d, sizeof(*font));
     font->source = source;
     font->identity = identity;
     font->next = d->fonts;
     d->fonts = font;
-    font->cff = cff_open(file->decoded, file->decoded_len, d->error, sizeof(d->error));
-    if (!font->cff)
-        fail(d, "Embedded CFF font could not load");
+    if (truetype) {
+        font->truetype = text_font_from_memory(file->decoded, file->decoded_len);
+        if (!font->truetype)
+            fail(d, "Embedded TrueType font could not load");
+    } else {
+        font->cff = cff_open(file->decoded, file->decoded_len, d->error, sizeof(d->error));
+        if (!font->cff)
+            fail(d, "Embedded CFF font could not load");
+    }
     font->widths = alloc(d, 65536 * sizeof(double));
     double default_width = 1000;
     Value *v;
@@ -802,7 +816,7 @@ static PdfFont *font_load(Pdf *d, Value *source) {
             fail(d, "Invalid simple font widths");
         for (size_t i = 0; i < widths->count; i++)
             font->widths[first + i] = num(d, item(d, widths, i));
-        if (get(d, source, "Encoding"))
+        if (!truetype && get(d, source, "Encoding"))
             fail(d, "PDF encoding overrides for simple CFF fonts unsupported");
     }
     return font;
@@ -961,7 +975,8 @@ Pdf *pdf_open(const char *filename, char *error, size_t error_size) {
         if (d->objects[i].used) {
             Value *v = d->objects[i].value;
             if (named(get(d, v, "Type"), "Font") &&
-                (named(get(d, v, "Subtype"), "Type0") || named(get(d, v, "Subtype"), "Type1")))
+                (named(get(d, v, "Subtype"), "Type0") || named(get(d, v, "Subtype"), "Type1") ||
+                 named(get(d, v, "Subtype"), "TrueType")))
                 font_load(d, v);
         }
     /* Also prepare direct font dictionaries in page/form resources. Cached font
@@ -989,8 +1004,10 @@ void pdf_close(Pdf *d) {
     if (!d)
         return;
     path_free(&d->work);
-    for (PdfFont *f = d->fonts; f; f = f->next)
+    for (PdfFont *f = d->fonts; f; f = f->next) {
         cff_close(f->cff);
+        text_font_free(f->truetype);
+    }
     for (int i = 0; i < d->page_count; i++)
         for (int j = 0; j < d->pages[i].animation_count; j++)
             animation_free((Animation *)d->pages[i].animations[j].info.clip);
@@ -1306,6 +1323,17 @@ typedef struct {
     double size, charspace, wordspace, hscale, leading, rise;
     int mode;
 } Text;
+/* WinAnsiEncoding as defined by PDF: Windows-1252, with unused codes shown as
+ * bullets and the non-breaking space and soft hyphen drawn as their plain forms. */
+static uint32_t winansi_unicode(unsigned code) {
+    static const uint16_t c1[32] = {
+        0x20ac, 0x2022, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x2022, 0x017d, 0x2022, 0x2022, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
+        0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x2022, 0x017e, 0x0178};
+    if (code >= 0x80 && code <= 0x9f)
+        return c1[code - 0x80];
+    return code == 0x7f ? 0x2022 : code == 0xa0 ? 0x20 : code == 0xad ? 0x2d : code;
+}
 static void text_show(Pdf *d, Canvas *canvas, Graphics *g, Text *text, Matrix *tm, Value *str) {
     require(d, str && str->kind == STRING && text->font, "Text show requires a font and string");
     unsigned stride = text->font->identity ? 2 : 1;
@@ -1323,8 +1351,13 @@ static void text_show(Pdf *d, Canvas *canvas, Graphics *g, Text *text, Matrix *t
         /* PDF glyph outlines must not modify the current content path. */
         Path glyph = {0};
         char error[160];
-        if (!cff_outline(text->font->cff, code, text->font->identity, transform, &glyph, error,
-                         sizeof(error))) {
+        if (text->font->truetype) {
+            if (!text_glyph_path(text->font->truetype, winansi_unicode(code), transform, &glyph)) {
+                path_free(&glyph);
+                fail(d, "Cannot outline TrueType glyph");
+            }
+        } else if (!cff_outline(text->font->cff, code, text->font->identity, transform, &glyph,
+                                error, sizeof(error))) {
             path_free(&glyph);
             fail(d, "CFF glyph: %s", error);
         }

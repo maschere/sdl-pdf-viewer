@@ -3,6 +3,7 @@
  *   'O' -> glyph 2, four off-curve points only (implied on-curve midpoints)
  *   'B' -> glyph 3, composite of glyph 1 shifted right by 50 units
  *   ' ' -> glyph 4, empty, advance 300
+ *   U+2019 -> glyph 1, for checking code-to-Unicode mappings
  * The 'kern' table moves the pair H,H together by 100 units. */
 #ifndef TTF_FIXTURE_H
 #define TTF_FIXTURE_H
@@ -53,27 +54,28 @@ static size_t ttf_fixture(uint8_t *out, size_t cap) {
     memset(t, 0, sizeof(t));
     /* cmap: one format 4 subtable (3,1) with delta-mapped single-code segments. */
     TtfBuffer *b = &t[0];
-    static const int codes[][2] = {{0x20, 4}, {0x42, 3}, {0x48, 1}, {0x4f, 2}, {0xffff, 0}};
+    static const int codes[][2] = {{0x20, 4},     {0x42, 3},  {0x48, 1},
+                                   {0x4f, 2},     {0x2019, 1}, {0xffff, 0}};
     ttf_put16(b, 0);
     ttf_put16(b, 1);
     ttf_put16(b, 3);
     ttf_put16(b, 1);
     ttf_put32(b, 12);
     ttf_put16(b, 4);
-    ttf_put16(b, 16 + 5 * 8);
+    ttf_put16(b, 16 + 6 * 8);
     ttf_put16(b, 0);
-    ttf_put16(b, 10); /* segCountX2 */
+    ttf_put16(b, 12); /* segCountX2 */
     ttf_put16(b, 8);
     ttf_put16(b, 2);
-    ttf_put16(b, 2);
-    for (int i = 0; i < 5; i++)
+    ttf_put16(b, 4);
+    for (int i = 0; i < 6; i++)
         ttf_put16(b, codes[i][0]);
     ttf_put16(b, 0);
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < 6; i++)
         ttf_put16(b, codes[i][0]);
-    for (int i = 0; i < 5; i++)
-        ttf_put16(b, i == 4 ? 1 : (codes[i][1] - codes[i][0]) & 0xffff);
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < 6; i++)
+        ttf_put16(b, i == 5 ? 1 : (codes[i][1] - codes[i][0]) & 0xffff);
+    for (int i = 0; i < 6; i++)
         ttf_put16(b, 0);
     /* glyf + loca (short offsets). */
     b = &t[1];
