@@ -25,18 +25,4 @@ bool animation_player_tick(AnimationPlayer *p, uint64_t now);
 void animation_player_toggle(AnimationPlayer *p, uint64_t now);
 int animation_player_wait(const AnimationPlayer *p, uint64_t now);
 
-typedef struct {
-    int index[4];
-    float weight[4];
-} AnimationSample;
-typedef struct {
-    int w, h, source_w, source_h;
-    AnimationSample *x, *y;
-    float *scratch;
-    uint8_t *pixels;
-} AnimationScaler;
-/* Cached separable Catmull-Rom kernels, premultiplied-alpha interpolation. */
-bool animation_scale_bicubic(AnimationScaler *s, const uint8_t *rgba, int source_w, int source_h,
-                             int w, int h);
-void animation_scaler_free(AnimationScaler *s);
 #endif

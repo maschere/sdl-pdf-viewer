@@ -106,22 +106,25 @@ static void player_tests(void) {
     CHECK(animation_player_tick(&p, p.next + 25 * p.interval) && p.frame == 2);
 }
 static void interpolation_tests(void) {
-    AnimationScaler s = {0};
+    ImageScaler s = {0};
     uint8_t source[8] = {255, 0, 0, 255, 0, 0, 255, 255};
-    CHECK(animation_scale_bicubic(&s, source, 2, 1, 8, 1));
+    CHECK(image_scale_bicubic(&s, source, 2, 1, 8, 1));
     CHECK(s.pixels[0] == 255 && s.pixels[2] == 0);
     CHECK(s.pixels[3 * 4] > 0 && s.pixels[3 * 4 + 2] > 0);
     for (int x = 0; x < 8; x++)
         CHECK(s.pixels[x * 4 + 3] == 255);
     source[7] = 0; /* A transparent blue neighbor must not create a blue halo. */
-    CHECK(animation_scale_bicubic(&s, source, 2, 1, 8, 1));
+    CHECK(image_scale_bicubic(&s, source, 2, 1, 8, 1));
     for (int x = 0; x < 8; x++) {
         CHECK(s.pixels[x * 4 + 2] == 0);
         if (s.pixels[x * 4 + 3])
             CHECK(s.pixels[x * 4] == 255);
     }
-    CHECK(!animation_scale_bicubic(&s, source, 2, 1, 16384, 16384));
-    animation_scaler_free(&s);
+    /* The cached kernels follow a change of size, as on a window resize. */
+    CHECK(image_scale_bicubic(&s, source, 2, 1, 1, 1) && s.w == 1 && s.h == 1);
+    CHECK(s.pixels[3] > 100 && s.pixels[3] < 155 && s.pixels[0] == 255);
+    CHECK(!image_scale_bicubic(&s, source, 2, 1, 16384, 16384));
+    image_scaler_free(&s);
 }
 static void pdf_tests(void) {
     char path[2048], error[256];

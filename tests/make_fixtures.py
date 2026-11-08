@@ -110,6 +110,7 @@ def simple(name, content, extras=b''):
 
 simple('vectors.pdf',b'1 0 0 rg 10 10 m 90 10 l 50 90 l f\n0 0 1 rg 20 20 60 60 re 30 30 40 40 re f*\n0 1 0 RG 3 w 1 J 1 j 5 90 m 25 50 75 50 95 90 c S\n')
 simple('clipping.pdf',b'q 25 25 50 50 re W n 1 0 0 rg 0 0 100 100 re f Q 0 0 1 rg 0 0 10 10 re f')
+simple('stroke-nonuniform.pdf',b'q 1 0 0 4 0 0 cm 2 w 10 20 m 90 20 l S Q q 4 0 0 1 0 0 cm 2 w 5 10 m 5 90 l S Q')
 simple('font-missing.pdf',b'BT /F1 12 Tf (Hello) Tj ET')
 simple('operator-unsupported.pdf',b'/GS1 gs')
 simple('path-clipping.pdf',b'0 0 m 100 0 l 0 100 l h W n 1 0 0 rg 0 0 100 100 re f')
@@ -184,6 +185,54 @@ def make_flex_glyph():
 
 write('cff-flex.pdf',[b'<< /Type /Catalog /Pages 2 0 R >>',b'<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 100 100] >>',b'<< /Type /Page /Parent 2 0 R /Resources << /Font << /F 5 0 R >> >> /Contents 4 0 R >>',
   stream(b'BT /F 100 Tf 0 0 Td (A) Tj ET'),b'<< /Type /Font /Subtype /Type1 /FontDescriptor 6 0 R /FirstChar 65 /LastChar 65 /Widths [1000] >>',b'<< /Type /FontDescriptor /FontFile3 7 0 R >>',stream(make_cff(glyph=make_flex_glyph()),b'/Subtype /Type1C')])
+
+# Minimal synthetic Type 1 font (FontMatrix 1/2000), one feature per glyph.
+T1_OPS = {'hstem':b'\x01','hlineto':b'\x06','vlineto':b'\x07','closepath':b'\x09','callsubr':b'\x0a','return':b'\x0b','hsbw':b'\x0d','endchar':b'\x0e','rmoveto':b'\x15','hmoveto':b'\x16','seac':b'\x0c\x06','div':b'\x0c\x0c','callothersubr':b'\x0c\x10','pop':b'\x0c\x11','setcurrentpoint':b'\x0c\x21'}
+
+def t1_encrypt(data, key, pad):
+    out, r = bytearray(), key
+    for c in bytes(pad)+data:
+        e = c^(r>>8)
+        out.append(e)
+        r = ((e+r)*52845+22719)&0xffff
+    return bytes(out)
+
+def t1_num(v):
+    if -107 <= v <= 107: return bytes([v+139])
+    if 108 <= v <= 1131: return bytes([247+((v-108)>>8),(v-108)&255])
+    if -1131 <= v <= -108: return bytes([251+((-v-108)>>8),(-v-108)&255])
+    return b'\xff'+v.to_bytes(4,'big',signed=True)
+
+def t1_code(items, leniv):
+    data = b''.join(T1_OPS[x] if isinstance(x,str) else t1_num(x) for x in items)
+    return t1_encrypt(data,4330,leniv) if leniv >= 0 else data
+
+def make_type1(leniv=4, hex_eexec=False):
+    square = [0,200,'rmoveto',1600,2,'div','hlineto',800,'vlineto',-800,'hlineto','closepath','endchar']
+    # A box whose bottom edge is a flex, preceded by a hint replacement.
+    flex = [(400,0),(-300,30),(100,20),(200,0),(200,0),(100,-20),(100,-30)]
+    flexy = [200,1000,'hsbw',4,1,3,'callothersubr','pop','callsubr',0,200,'rmoveto',1,'callsubr']
+    for dx,dy in flex: flexy += [dx,dy,'rmoveto',2,'callsubr']
+    flexy += [50,1000,200,0,'callsubr',800,'vlineto',-800,'hlineto','closepath','endchar']
+    subrs = [[3,0,'callothersubr','pop','pop','setcurrentpoint','return'],[0,1,'callothersubr','return'],[0,2,'callothersubr','return'],['return'],[100,200,'hstem','return']]
+    glyphs = {'.notdef':[0,500,'hsbw','endchar'],'A':[200,1000,'hsbw']+square,'acute':[100,400,'hsbw',0,'hmoveto',200,'hlineto',200,'vlineto',-200,'hlineto','closepath','endchar'],'Aacute':[200,1000,'hsbw',100,700,1200,65,194,'seac'],'flexy':flexy}
+    private = b'dup /Private 8 dict dup begin\n/RD {string currentfile exch readstring pop} executeonly def\n/ND {noaccess def} executeonly def\n/NP {noaccess put} executeonly def\n/lenIV %d def\n/Subrs %d array\n' % (leniv,len(subrs))
+    for i,subr in enumerate(subrs):
+        code = t1_code(subr,leniv)
+        private += b'dup %d %d RD ' % (i,len(code))+code+b' NP\n'
+    private += b'ND\n2 index /CharStrings %d dict dup begin\n' % len(glyphs)
+    for name,items in glyphs.items():
+        code = t1_code(items,leniv)
+        private += b'/%s %d RD ' % (name.encode(),len(code))+code+b' ND\n'
+    private += b'end\nend\nreadonly put\nnoaccess put\ndup /FontName get exch definefont pop\nmark currentfile closefile\n'
+    clear = b'%!PS-AdobeFont-1.0: Fixture\n12 dict begin\n/FontName /Fixture def\n/Encoding 256 array\n0 1 255 {1 index exch /.notdef put} for\ndup 65 /A put\nreadonly def\n/PaintType 0 def\n/FontType 1 def\n/FontMatrix [0.0005 0 0 0.0005 0 0] readonly def\n/FontBBox {0 0 2000 2000} readonly def\ncurrentdict end\ncurrentfile eexec\n'
+    cipher = t1_encrypt(private,55665,4)
+    return clear+(cipher.hex().encode() if hex_eexec else cipher)+b'\n'+b'0'*64+b'\ncleartomark\n'
+
+(ROOT/'type1-font.pfa').write_bytes(make_type1())
+for name,leniv,hex_eexec in [('type1.pdf',4,False),('type1-hex.pdf',0,True)]:
+    write(name,[b'<< /Type /Catalog /Pages 2 0 R >>',b'<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 100 100] >>',b'<< /Type /Page /Parent 2 0 R /Resources << /Font << /F 5 0 R >> >> /Contents 4 0 R >>',
+      stream(b'BT /F 50 Tf 0 0 Td (A) Tj 50 0 Td (B) Tj -50 50 Td (C) Tj ET'),b'<< /Type /Font /Subtype /Type1 /FontDescriptor 6 0 R /FirstChar 65 /LastChar 67 /Widths [0 0 0] /Encoding 8 0 R >>',b'<< /Type /FontDescriptor /FontName /Fixture /FontFile 7 0 R >>',stream(make_type1(leniv,hex_eexec)),b'<< /Type /Encoding /Differences [66 /Aacute /flexy] >>'])
 
 # Reusable form, constant alpha, stitched gradient and a luminosity soft mask.
 write('graphics.pdf',[

@@ -4,6 +4,8 @@
 #include <string.h>
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define SCALE_MAX_SIDE 16384
+#define SCALE_MAX_PIXELS 16000000u
 Matrix matrix_mul(Matrix o, Matrix i) {
     return (Matrix){o.a * i.a + o.c * i.b,       o.b * i.a + o.d * i.b,
                     o.a * i.c + o.c * i.d,       o.b * i.c + o.d * i.d,
@@ -282,8 +284,10 @@ void canvas_disk(Canvas *c, Point center, double radius, uint32_t rgb) {
         canvas_fill(c, &p, rgb, false);
     path_free(&p);
 }
-bool canvas_stroke(Canvas *c, const Path *p, uint32_t rgb, double width, int cap, int join,
-                   double miter) {
+/* Builds the outline with a circular pen around `p`, optionally mapping the
+ * finished outline through `pen` before filling. */
+static bool stroke_path(Canvas *c, const Path *p, uint32_t rgb, double width, int cap, int join,
+                        double miter, const Matrix *pen) {
     double r = width > 0 ? width * .5 : .5;
     Path outline = {0};
     bool ok = true;
@@ -359,12 +363,43 @@ bool canvas_stroke(Canvas *c, const Path *p, uint32_t rgb, double width, int cap
             }
         }
     }
+    /* A linear map flips every piece's winding alike, so the union is preserved. */
+    for (size_t i = 0; pen && i < outline.count; i++) {
+        outline.edges[i].a = matrix_point(*pen, outline.edges[i].a);
+        outline.edges[i].b = matrix_point(*pen, outline.edges[i].b);
+    }
     ok = canvas_fill(c, &outline, rgb, false);
     path_free(&outline);
     return ok;
 failed:
     path_free(&outline);
     return false;
+}
+bool canvas_stroke(Canvas *c, const Path *p, uint32_t rgb, double width, int cap, int join,
+                   double miter) {
+    return stroke_path(c, p, rgb, width, cap, join, miter, NULL);
+}
+bool canvas_stroke_pen(Canvas *c, const Path *p, uint32_t rgb, double width, int cap, int join,
+                       double miter, Matrix pen) {
+    Matrix linear = {pen.a, pen.b, pen.c, pen.d, 0, 0}, inverse;
+    if (!matrix_inverse(linear, &inverse))
+        return false;
+    if (!p->count)
+        return true;
+    /* Stroke in the space where the pen is circular. */
+    Path local = {0};
+    local.edges = malloc(p->count * sizeof(*local.edges));
+    if (!local.edges)
+        return false;
+    local.count = p->count;
+    for (size_t i = 0; i < p->count; i++) {
+        local.edges[i] = p->edges[i];
+        local.edges[i].a = matrix_point(inverse, p->edges[i].a);
+        local.edges[i].b = matrix_point(inverse, p->edges[i].b);
+    }
+    bool ok = stroke_path(c, &local, rgb, width, cap, join, miter, &linear);
+    path_free(&local);
+    return ok;
 }
 void canvas_image(Canvas *c, const uint8_t *rgba, int w, int h, Matrix m) {
     Matrix inv;
@@ -393,4 +428,126 @@ void canvas_image(Canvas *c, const uint8_t *rgba, int w, int h, Matrix m) {
             const uint8_t *s = rgba + ((size_t)iy * w + ix) * 4;
             canvas_paint(c, x, y, (uint32_t)s[0] << 16 | (uint32_t)s[1] << 8 | s[2], s[3]);
         }
+}
+/* The same Catmull-Rom curve as the animation scaler. Its support is widened in
+ * proportion when minifying, so that shrunken images average instead of alias. */
+static double catmull_rom(double x) {
+    x = fabs(x);
+    return x < 1 ? 1 - 2.5 * x * x + 1.5 * x * x * x
+           : x < 2 ? 2 - 4 * x + 2.5 * x * x - .5 * x * x * x
+                   : 0;
+}
+static bool filter_build(ImageFilter *f, int from, int to) {
+    double scale = MAX(1, (double)from / to), support = 2 * scale;
+    f->taps = (size_t)ceil(2 * support) + 1;
+    f->spans = malloc((size_t)to * sizeof(*f->spans));
+    f->weights = malloc((size_t)to * f->taps * sizeof(*f->weights));
+    if (!f->spans || !f->weights)
+        return false;
+    for (int i = 0; i < to; i++) {
+        double center = (i + .5) * from / to, sum = 0;
+        int first = (int)MAX(0, ceil(center - support - .5));
+        int last = (int)MIN(from - 1, floor(center + support - .5));
+        float *w = f->weights + (size_t)i * f->taps;
+        int count = 0;
+        for (int j = first; j <= last; j++) {
+            double v = catmull_rom((j + .5 - center) / scale);
+            w[count++] = (float)v;
+            sum += v;
+        }
+        /* Renormalized, since samples past the image's edges are dropped. */
+        for (int k = 0; sum != 0 && k < count; k++)
+            w[k] = (float)(w[k] / sum);
+        f->spans[i] = (ImageFilterSpan){first, count};
+    }
+    return true;
+}
+void image_scaler_free(ImageScaler *s) {
+    free(s->x.spans);
+    free(s->x.weights);
+    free(s->y.spans);
+    free(s->y.weights);
+    free(s->rows);
+    free(s->line);
+    free(s->pixels);
+    memset(s, 0, sizeof(*s));
+}
+static bool scale_size_valid(int w, int h) {
+    return w >= 1 && h >= 1 && w <= SCALE_MAX_SIDE && h <= SCALE_MAX_SIDE &&
+           (size_t)w * h <= SCALE_MAX_PIXELS;
+}
+bool image_scale_bicubic(ImageScaler *s, const uint8_t *rgba, int sw, int sh, int w, int h) {
+    if (!scale_size_valid(sw, sh) || !scale_size_valid(w, h) || (size_t)w * sh > SCALE_MAX_PIXELS)
+        return false;
+    if (s->w != w || s->h != h || s->source_w != sw || s->source_h != sh) {
+        image_scaler_free(s);
+        s->rows = malloc((size_t)w * sh * 4 * sizeof(*s->rows));
+        s->line = malloc((size_t)w * 4 * sizeof(*s->line));
+        s->pixels = malloc((size_t)w * h * 4);
+        if (!s->rows || !s->line || !s->pixels || !filter_build(&s->x, sw, w) ||
+            !filter_build(&s->y, sh, h)) {
+            image_scaler_free(s);
+            return false;
+        }
+        s->w = w;
+        s->h = h;
+        s->source_w = sw;
+        s->source_h = sh;
+    }
+    for (int y = 0; y < sh; y++) {
+        const uint8_t *row = rgba + (size_t)y * sw * 4;
+        float *o = s->rows + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++, o += 4) {
+            ImageFilterSpan span = s->x.spans[x];
+            const float *weight = s->x.weights + (size_t)x * s->x.taps;
+            float v[4] = {0};
+            for (int t = 0; t < span.count; t++) {
+                const uint8_t *p = row + (size_t)(span.first + t) * 4;
+                float color = p[3] / 255.f * weight[t];
+                v[0] += p[0] * color;
+                v[1] += p[1] * color;
+                v[2] += p[2] * color;
+                v[3] += p[3] * weight[t];
+            }
+            memcpy(o, v, sizeof(v));
+        }
+    }
+    for (int y = 0; y < h; y++) {
+        ImageFilterSpan span = s->y.spans[y];
+        const float *weight = s->y.weights + (size_t)y * s->y.taps;
+        memset(s->line, 0, (size_t)w * 4 * sizeof(*s->line));
+        for (int t = 0; t < span.count; t++) {
+            const float *row = s->rows + (size_t)(span.first + t) * w * 4;
+            for (int i = 0; i < w * 4; i++)
+                s->line[i] += row[i] * weight[t];
+        }
+        uint8_t *o = s->pixels + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++, o += 4) {
+            const float *v = s->line + (size_t)x * 4;
+            double alpha = MAX(0, MIN(255, v[3]));
+            for (int k = 0; k < 3; k++)
+                o[k] = alpha > 0 ? (uint8_t)(MAX(0, MIN(255, v[k] * 255 / alpha)) + .5) : 0;
+            o[3] = (uint8_t)(alpha + .5);
+        }
+    }
+    return true;
+}
+void canvas_image_bicubic(Canvas *c, const uint8_t *rgba, int w, int h, Matrix m) {
+    /* Resample to the output size, within the scaler's limits, then place it
+     * pixel for pixel. */
+    double tw = MIN(SCALE_MAX_SIDE, ceil(hypot(m.a, m.b)));
+    double th = MIN(SCALE_MAX_SIDE, ceil(hypot(m.c, m.d)));
+    if (isfinite(tw) && isfinite(th) && tw * th > SCALE_MAX_PIXELS) {
+        double shrink = sqrt(SCALE_MAX_PIXELS / (tw * th));
+        tw = floor(tw * shrink);
+        th = floor(th * shrink);
+    }
+    if (tw * h > SCALE_MAX_PIXELS)
+        tw = floor((double)SCALE_MAX_PIXELS / h);
+    ImageScaler s = {0};
+    /* Failing only loses the smoothing, not the image. */
+    bool scaled = tw >= 1 && th >= 1 && ((int)tw != w || (int)th != h) &&
+                  image_scale_bicubic(&s, rgba, w, h, (int)tw, (int)th);
+    canvas_image(c, scaled ? s.pixels : rgba, scaled ? s.w : w, scaled ? s.h : h, m);
+    image_scaler_free(&s);
 }

@@ -20,7 +20,7 @@
 typedef struct {
     const PdfAnimation *info;
     AnimationPlayer player;
-    AnimationScaler scaler;
+    ImageScaler scaler;
     SDL_Texture *texture;
     int uploaded_frame, texture_w, texture_h;
     SDL_FPoint origin, right, down;
@@ -61,7 +61,7 @@ typedef struct {
 static void free_playbacks(App *a) {
     for (int i = 0; i < a->playback_count; i++) {
         SDL_DestroyTexture(a->playbacks[i].texture);
-        animation_scaler_free(&a->playbacks[i].scaler);
+        image_scaler_free(&a->playbacks[i].scaler);
     }
     free(a->playbacks);
     a->playbacks = NULL;
@@ -341,7 +341,7 @@ static bool playback_texture(App *a, Playback *p) {
             w = 1;
         if (h < 1)
             h = 1;
-        if (!animation_scale_bicubic(&p->scaler, pixels, clip->w, clip->h, w, h))
+        if (!image_scale_bicubic(&p->scaler, pixels, clip->w, clip->h, w, h))
             return SDL_SetError("Cannot bicubic-scale animation");
         pixels = p->scaler.pixels;
     }

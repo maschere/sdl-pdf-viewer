@@ -1,5 +1,6 @@
 #include "pdf.h"
 #include "ttf_fixture.h"
+#include "type1.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,6 +79,39 @@ static void write_truetype_pdf(const char *path, const char *encoding) {
     fprintf(f, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%ld\n%%%%EOF\n", COUNT + 1, xref);
     CHECK(!fclose(f));
 }
+/* Opens and outlines every glyph of a possibly damaged Type 1 font program; it
+ * may fail, but must do so cleanly (AddressSanitizer builds check the rest). */
+static void exercise_type1(const unsigned char *data, size_t size) {
+    static const char *const names[] = {".notdef", "A", "acute", "Aacute", "flexy"};
+    char error[160];
+    Type1 *font = type1_open(data, size, error, sizeof(error));
+    if (!font)
+        return;
+    for (size_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
+        Path path = {0};
+        int glyph = type1_glyph(font, names[i], strlen(names[i]));
+        type1_outline(font, glyph, (Matrix){1, 0, 0, 1, 0, 0}, &path, error, sizeof(error));
+        path_free(&path);
+    }
+    type1_close(font);
+}
+static void check_damaged_type1(const char *root) {
+    char file[2048];
+    snprintf(file, sizeof(file), "%s/type1-font.pfa", root);
+    FILE *f = fopen(file, "rb");
+    CHECK(f);
+    static unsigned char font[16384];
+    size_t size = fread(font, 1, sizeof(font), f);
+    fclose(f);
+    CHECK(size > 0 && size < sizeof(font));
+    for (size_t n = 0; n < size; n++)
+        exercise_type1(font, n);
+    for (size_t i = 0; i < size; i++) {
+        font[i] ^= 0x55;
+        exercise_type1(font, size);
+        font[i] ^= 0x55;
+    }
+}
 int main(int argc, char **argv) {
     CHECK(argc >= 2);
     const char *root = argv[1];
@@ -87,14 +121,16 @@ int main(int argc, char **argv) {
     Matrix m;
     CHECK(canvas_init(&c, 400, 300));
     CHECK(pdf_render(d, 0, &c, &m));
-    rgb(&c, 50, 170, 255, 0, 0, 0);
-    rgb(&c, 110, 170, 0, 255, 0, 0);
-    rgb(&c, 50, 230, 0, 0, 255, 0);
-    rgb(&c, 110, 230, 255, 255, 0, 0);
+    /* Bicubic images: true at the source pixels' centers, blended between them. */
+    rgb(&c, 50, 170, 255, 0, 0, 3);
+    rgb(&c, 110, 170, 0, 255, 0, 3);
+    rgb(&c, 50, 230, 0, 0, 255, 3);
+    rgb(&c, 110, 230, 255, 255, 0, 3);
+    rgb(&c, 80, 170, 128, 128, 0, 8);
     rgb(&c, 200, 200, 255, 0, 255, 3);
     rgb(&c, 320, 210, 127, 127, 255, 1);
-    rgb(&c, 25, 280, 255, 0, 0, 0);
-    rgb(&c, 55, 280, 0, 255, 0, 0);
+    rgb(&c, 30, 280, 255, 0, 0, 3);
+    rgb(&c, 50, 280, 0, 255, 0, 3);
     PdfLink link;
     CHECK(pdf_link_at(d, 0, (Point){300, 210}, &link) && link.page == 1 && !link.url);
     CHECK(pdf_link_at(d, 0, (Point){300, 150}, &link) &&
@@ -179,6 +215,35 @@ int main(int argc, char **argv) {
     rgb(&c, 57, 30, 0, 0, 0, 0); /* The vertical flex1 square. */
     rgb(&c, 63, 30, 255, 255, 255, 0);
     pdf_close(d);
+    /* Width-2 strokes under 4x vertical and horizontal scales are 8 pixels
+     * across, while their lengths along the other axis stay unscaled. */
+    d = open_fixture(root, "stroke-nonuniform.pdf", true);
+    CHECK(pdf_render(d, 0, &c, &m));
+    rgb(&c, 60, 17, 0, 0, 0, 0);
+    rgb(&c, 60, 14, 255, 255, 255, 0);
+    rgb(&c, 17, 60, 0, 0, 0, 0);
+    rgb(&c, 14, 60, 255, 255, 255, 0);
+    rgb(&c, 88, 20, 0, 0, 0, 0);
+    rgb(&c, 92, 20, 255, 255, 255, 0);
+    pdf_close(d);
+    /* Type 1: A through the built-in encoding; B and C through Differences to a
+     * seac composite and a flex-edged box. Binary with lenIV 4, hex with lenIV 0. */
+    const char *type1_files[] = {"type1.pdf", "type1-hex.pdf"};
+    for (int i = 0; i < 2; i++) {
+        d = open_fixture(root, type1_files[i], true);
+        CHECK(pdf_render(d, 0, &c, &m));
+        rgb(&c, 15, 85, 0, 0, 0, 0);       /* A: the FontMatrix sets its 5..25 extent. */
+        rgb(&c, 30, 85, 255, 255, 255, 0);
+        rgb(&c, 65, 85, 0, 0, 0, 0);       /* seac base. */
+        rgb(&c, 75, 67, 0, 0, 0, 0);       /* seac accent, offset by the side bearing. */
+        rgb(&c, 70, 60, 255, 255, 255, 0);
+        rgb(&c, 15, 35, 0, 0, 0, 0);       /* The flex box's interior... */
+        rgb(&c, 22, 28, 0, 0, 0, 0);       /* ...undistorted top right corner... */
+        rgb(&c, 22, 22, 255, 255, 255, 0);
+        rgb(&c, 15, 44, 255, 255, 255, 0); /* ...and the flex's raised bottom edge. */
+        pdf_close(d);
+    }
+    check_damaged_type1(root);
     /* Embedded TrueType, as in slides imported from Office-made PDFs: squares
      * at x 15-40 and, after the 1000-unit PDF width, x 65-90. */
     const char *truetype = "test_pdf_truetype.pdf";

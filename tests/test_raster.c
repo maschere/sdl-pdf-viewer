@@ -129,11 +129,48 @@ static void brush_tests(Canvas *c) {
     c->clip = (Box){0, 0, c->w, c->h};
     brush_free(&b);
 }
+static void image_tests(Canvas *c) {
+    /* Enlarging a black and a white pixel gives a smooth ramp between them. */
+    const uint8_t edge[8] = {0, 0, 0, 255, 255, 255, 255, 255};
+    canvas_clear(c, 0xff0000);
+    canvas_image_bicubic(c, edge, 2, 1, (Matrix){40, 0, 0, -10, 10, 30});
+    CHECK(red(c, 20, 25) <= 8 && red(c, 39, 25) >= 247); /* Next to the source pixels' centers. */
+    CHECK(abs((int)red(c, 30, 25) - 127) <= 20);
+    for (int x = 20; x < 39; x++)
+        CHECK(red(c, x + 1, 25) >= red(c, x, 25));
+    /* Shrinking a fine checkerboard averages it instead of picking pixels. */
+    static uint8_t checker[64 * 64 * 4];
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++) {
+            uint8_t *p = checker + ((size_t)y * 64 + x) * 4;
+            memset(p, (x + y) & 1 ? 255 : 0, 3);
+            p[3] = 255;
+        }
+    canvas_clear(c, 0xff0000);
+    canvas_image_bicubic(c, checker, 64, 64, (Matrix){8, 0, 0, -8, 20, 40});
+    for (int y = 32; y < 40; y++)
+        for (int x = 20; x < 28; x++)
+            CHECK(abs((int)red(c, x, y) - 127) <= 12);
+    /* A transparent blue neighbor must not tint the red pixel's edge. */
+    const uint8_t fade[8] = {255, 0, 0, 255, 0, 0, 255, 0};
+    canvas_clear(c, 0xffffff);
+    canvas_image_bicubic(c, fade, 2, 1, (Matrix){40, 0, 0, -10, 10, 30});
+    for (int x = 10; x < 50; x++) {
+        const uint8_t *p = c->pixels + ((size_t)25 * c->w + x) * 4;
+        CHECK(abs((int)p[1] - p[2]) <= 1);
+    }
+    /* At its native size an image is copied exactly. */
+    const uint8_t native[8] = {10, 20, 30, 255, 200, 150, 100, 255};
+    canvas_clear(c, 0xffffff);
+    canvas_image_bicubic(c, native, 2, 1, (Matrix){2, 0, 0, -1, 5, 6});
+    CHECK(red(c, 5, 5) == 10 && red(c, 6, 5) == 200);
+}
 int main(void) {
     Canvas c = {0};
     CHECK(canvas_init(&c, 64, 64));
     coverage_tests(&c);
     stroke_tests(&c);
+    image_tests(&c);
     brush_tests(&c);
     canvas_free(&c);
     puts("Subpixel fills, diagonal coverage, fill rules, clipping, translucent stroke unions "

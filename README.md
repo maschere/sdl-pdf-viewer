@@ -206,10 +206,10 @@ CRC/sequence errors are rejected.
 | Streams | Uncompressed or FlateDecode; content stream arrays share graphics state |
 | Paths | Moves, lines, cubic curves, rectangles, closed/open paths |
 | Painting | Nonzero/even-odd fills; solid strokes, butt/round/square caps, miter/round/bevel joins |
-| Transforms | Affine transforms for fills, glyphs, forms and images; uniform scale/rotation/reflection for strokes |
+| Transforms | Affine transforms for fills, strokes, glyphs, forms and images |
 | Colors | DeviceGray, DeviceRGB; interpolated default DeviceCMYK conversion for vector paint |
 | Graphics state | q/Q, widths, caps, joins, miter limit; rectangular and arbitrary path clipping |
-| Text | Embedded CFF Type 2 outlines; CIDFontType0/Identity-H and simple Type1C encodings; simple TrueType fonts with WinAnsiEncoding and a Unicode cmap; PDF widths, text matrices and TJ adjustments |
+| Text | Embedded CFF Type 2 outlines; CIDFontType0/Identity-H and simple Type1C encodings; simple Type 1 fonts (built-in or Standard encoding, Differences); simple TrueType fonts with WinAnsiEncoding and a Unicode cmap; PDF widths, text matrices and TJ adjustments |
 | Forms | Nested Form XObjects with resources, Matrix and BBox |
 | Gradients | Axial and concentric growing radial shadings; exponential and stitching functions |
 | Transparency | Constant fill/stroke alpha and luminosity Form soft masks |
@@ -221,7 +221,9 @@ CRC/sequence errors are rejected.
 | Links | Direct Dest, GoTo actions, legacy destination dictionaries, destination name trees |
 | Browser links | URI actions for HTTP/HTTPS through SDL_OpenURL |
 
-Images use nearest-neighbor sampling. CFF hints are parsed but no grid fitting is
+Static images are resampled to the output size with a separable Catmull-Rom
+bicubic filter, widened when shrinking so that fine detail averages instead of
+aliasing; animations default to nearest-neighbor instead. CFF hints are parsed but no grid fitting is
 applied. DeviceCMYK uses a sampled default output conversion table, interpolated
 in portable C. It is an explicit approximation, not document-specific ICC color
 management. D65 CalRGB images are converted through their gamma/matrix into sRGB.
@@ -234,7 +236,7 @@ chains are ignored. Links do not trigger JavaScript, file launch, embedded-file
 opening, or remote-PDF navigation.
 
 Unsupported features still include composite (CIDFontType2), symbolic and
-non-WinAnsi TrueType fonts, OpenType font programs, Type 1 eexec programs, non-Identity composite encodings, simple-font encoding overrides,
+non-WinAnsi TrueType fonts, WinAnsi/MacRoman-encoded Type 1 fonts, OpenType font programs, non-Identity composite encodings, simple-font encoding overrides,
 inline images, CMYK/ICC/Separation images, stencil/color-key masks, Matte images,
 non-normal blend modes, general transparency group isolation/knockout, arbitrary
 radial circle arrangements, dashed strokes, patterns, encryption, hybrid xrefs
@@ -262,11 +264,12 @@ python3 tests/make_animation_fixtures.py
 - `src/pdf.c`: tokenizer, objects/xrefs, page tree, interpreter, font integration,
   forms, gradients, image codecs, predictors, masks and destination/link resolution.
 - `src/cff.c`: CFF indexes, dictionaries, charsets, encodings, CID maps and Type 2 outlines.
+- `src/type1.c`: Type 1 eexec/charstring decryption, encodings, flex, seac and outlines.
 - `src/cmyk_table.h`: sampled numeric data for default DeviceCMYK conversion.
-- `src/raster.c`: affine math, path flattening, coverage scanline fills, stroke unions and images.
+- `src/raster.c`: affine math, path flattening, coverage scanline fills, stroke unions, images
+  and cached bicubic resampling.
 - `src/brush.c`: pixel-filtered soft brush and per-stroke coverage compositing.
-- `src/animation.c`: giflib/libpng decoding, GIF/APNG compositing, FPS clock and
-  cached bicubic resampling.
+- `src/animation.c`: giflib/libpng decoding, GIF/APNG compositing and FPS clock.
 - `src/ink.h`: portable midpoint smoothing and drag threshold.
 - `src/main.c`: SDL event loop, fullscreen, high-DPI input, temporary ink, CLI.
 - `tests/`: pixel assertions, image orientation/predictor checks, destination

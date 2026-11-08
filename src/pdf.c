@@ -2,6 +2,7 @@
 #include "cff.h"
 #include "cmyk_table.h"
 #include "text.h"
+#include "type1.h"
 #include <ctype.h>
 #include <limits.h>
 #include <setjmp.h>
@@ -66,8 +67,10 @@ typedef struct {
     Box *placeholders;
 } Page;
 typedef struct PdfFont {
-    Cff *cff;           /* Exactly one of cff and truetype is set. */
+    Cff *cff;           /* Exactly one of cff, truetype and type1 is set. */
     TextFont *truetype; /* Simple font: character codes are WinAnsi. */
+    Type1 *type1;       /* Simple font: type1_glyphs maps character codes to glyphs. */
+    int *type1_glyphs;
     Value *source;
     bool identity;
     double *widths;
@@ -738,6 +741,35 @@ static void load_animations(Pdf *d, Page *page) {
             (AttachedAnimation){info, anchor, !info.positioned};
     }
 }
+/* Fills the code-to-glyph map: the font's built-in encoding or StandardEncoding,
+ * then any PDF Differences by glyph name. */
+static void type1_load_encoding(Pdf *d, PdfFont *font, Value *source) {
+    Value *encoding = get(d, source, "Encoding"), *base = encoding, *differences = NULL;
+    if (encoding && encoding->kind == DICT) {
+        base = get(d, encoding, "BaseEncoding");
+        differences = get(d, encoding, "Differences");
+    }
+    if (base && !named(base, "StandardEncoding"))
+        fail(d, "Only Differences and StandardEncoding supported for Type 1 fonts");
+    font->type1_glyphs = alloc(d, 256 * sizeof(int));
+    for (unsigned code = 0; code < 256; code++)
+        font->type1_glyphs[code] = base ? type1_standard_glyph(font->type1, code)
+                                        : type1_builtin_glyph(font->type1, code);
+    if (!differences)
+        return;
+    if (differences->kind != ARRAY)
+        fail(d, "Invalid font encoding Differences");
+    int code = 0;
+    for (size_t i = 0; i < differences->count; i++) {
+        Value *v = item(d, differences, i);
+        if (v->kind == NUMBER)
+            code = integer(d, v, 0, 255);
+        else if (v->kind == NAME && code < 256)
+            font->type1_glyphs[code++] = type1_glyph(font->type1, v->text, v->len);
+        else
+            fail(d, "Invalid font encoding Differences");
+    }
+}
 static PdfFont *font_load(Pdf *d, Value *source) {
     for (PdfFont *f = d->fonts; f; f = f->next)
         if (f->source == source)
@@ -755,13 +787,16 @@ static PdfFont *font_load(Pdf *d, Value *source) {
         fail(d, "Expected an embedded CFF or TrueType font");
     Value *descriptor = get(d, metrics, "FontDescriptor");
     Value *file = get(d, descriptor, truetype ? "FontFile2" : "FontFile3");
+    bool type1 = !identity && !truetype && !file && get(d, descriptor, "FontFile");
+    if (type1)
+        file = get(d, descriptor, "FontFile");
     if (!file || !file->decoded)
         fail(d, truetype ? "Font requires embedded TrueType outlines"
-                         : "Font requires embedded CFF outlines");
+                         : "Font requires embedded CFF or Type 1 outlines");
     if (truetype) {
         if (!named(get(d, source, "Encoding"), "WinAnsiEncoding"))
             fail(d, "Only WinAnsiEncoding simple TrueType fonts supported");
-    } else if (!named(get(d, file, "Subtype"), "Type1C") &&
+    } else if (!type1 && !named(get(d, file, "Subtype"), "Type1C") &&
                !named(get(d, file, "Subtype"), "CIDFontType0C"))
         fail(d, "Unsupported embedded font format");
     PdfFont *font = alloc(d, sizeof(*font));
@@ -773,6 +808,12 @@ static PdfFont *font_load(Pdf *d, Value *source) {
         font->truetype = text_font_from_memory(file->decoded, file->decoded_len);
         if (!font->truetype)
             fail(d, "Embedded TrueType font could not load");
+    } else if (type1) {
+        char error[160];
+        font->type1 = type1_open(file->decoded, file->decoded_len, error, sizeof(error));
+        if (!font->type1)
+            fail(d, "Embedded Type 1 font could not load: %s", error);
+        type1_load_encoding(d, font, source);
     } else {
         font->cff = cff_open(file->decoded, file->decoded_len, d->error, sizeof(d->error));
         if (!font->cff)
@@ -816,7 +857,7 @@ static PdfFont *font_load(Pdf *d, Value *source) {
             fail(d, "Invalid simple font widths");
         for (size_t i = 0; i < widths->count; i++)
             font->widths[first + i] = num(d, item(d, widths, i));
-        if (!truetype && get(d, source, "Encoding"))
+        if (!truetype && !type1 && get(d, source, "Encoding"))
             fail(d, "PDF encoding overrides for simple CFF fonts unsupported");
     }
     return font;
@@ -1007,6 +1048,7 @@ void pdf_close(Pdf *d) {
     for (PdfFont *f = d->fonts; f; f = f->next) {
         cff_close(f->cff);
         text_font_free(f->truetype);
+        type1_close(f->type1);
     }
     for (int i = 0; i < d->page_count; i++)
         for (int j = 0; j < d->pages[i].animation_count; j++)
@@ -1356,6 +1398,12 @@ static void text_show(Pdf *d, Canvas *canvas, Graphics *g, Text *text, Matrix *t
                 path_free(&glyph);
                 fail(d, "Cannot outline TrueType glyph");
             }
+        } else if (text->font->type1) {
+            if (!type1_outline(text->font->type1, text->font->type1_glyphs[code], transform, &glyph,
+                               error, sizeof(error))) {
+                path_free(&glyph);
+                fail(d, "Type 1 glyph: %s", error);
+            }
         } else if (!cff_outline(text->font->cff, code, text->font->identity, transform, &glyph,
                                 error, sizeof(error))) {
             path_free(&glyph);
@@ -1691,12 +1739,21 @@ static void interpret(Pdf *d, Page *page, Canvas *canvas, const unsigned char *d
             if (stroke) {
                 canvas->opacity = g.stroke_alpha;
                 double sx = hypot(g.ctm.a, g.ctm.b), sy = hypot(g.ctm.c, g.ctm.d),
-                       dot = g.ctm.a * g.ctm.c + g.ctm.b * g.ctm.d;
-                require(d, fabs(sx - sy) < 1e-6 * MAX(1, sx) && fabs(dot) < 1e-6 * MAX(1, sx * sy),
-                        "Nonuniform/sheared stroke transforms unsupported");
-                require(d,
-                        canvas_stroke(canvas, path, g.stroke, g.width * sx, g.cap, g.join, g.miter),
-                        "Stroke allocation failed");
+                       dot = g.ctm.a * g.ctm.c + g.ctm.b * g.ctm.d,
+                       det = g.ctm.a * g.ctm.d - g.ctm.b * g.ctm.c;
+                bool circular =
+                    fabs(sx - sy) < 1e-6 * MAX(1, sx) && fabs(dot) < 1e-6 * MAX(1, sx * sy);
+                bool ok;
+                if (circular || !(g.width > 0) || fabs(det) < 1e-12)
+                    ok = canvas_stroke(canvas, path, g.stroke, g.width * sx, g.cap, g.join, g.miter);
+                else {
+                    /* Unit-determinant pen, keeping curve flattening at output scale. */
+                    double s = sqrt(fabs(det));
+                    Matrix pen = {g.ctm.a / s, g.ctm.b / s, g.ctm.c / s, g.ctm.d / s, 0, 0};
+                    ok = canvas_stroke_pen(canvas, path, g.stroke, g.width * s, g.cap, g.join,
+                                           g.miter, pen);
+                }
+                require(d, ok, "Stroke allocation failed");
             }
             if (clip_pending) {
                 if (rect_path)
@@ -1718,7 +1775,7 @@ static void interpret(Pdf *d, Page *page, Canvas *canvas, const unsigned char *d
             else {
                 int w, h;
                 unsigned char *pixels = image(d, v, &w, &h, 0);
-                canvas_image(canvas, pixels, w, h, g.ctm);
+                canvas_image_bicubic(canvas, pixels, w, h, g.ctm);
             }
         } else if (OP("gs", 1)) {
             require(d, args[0]->kind == NAME, "Invalid graphics state name");
@@ -1915,25 +1972,10 @@ static void place_animations(Pdf *d, Page *page, Canvas *canvas, Matrix view, bo
             Matrix transform =
                 matrix_mul(view, (Matrix){b.x1 - b.x0, 0, 0, b.y1 - b.y0, b.x0, b.y0});
             const Animation *clip = info->clip;
-            const uint8_t *rgba = clip->frames[0];
-            int w = clip->w, h = clip->h;
-            AnimationScaler scaler = {0};
-            if (info->interpolation == ANIMATION_BICUBIC) {
-                double width = ceil(hypot(transform.a, transform.b));
-                double height = ceil(hypot(transform.c, transform.d));
-                require(d, isfinite(width) && isfinite(height) && width <= 16384 && height <= 16384,
-                        "Animation display dimensions exceed limits");
-                w = MAX(1, (int)width);
-                h = MAX(1, (int)height);
-                bool ok = animation_scale_bicubic(&scaler, rgba, clip->w, clip->h, w, h);
-                if (!ok) {
-                    animation_scaler_free(&scaler);
-                    fail(d, "Cannot scale animation frame");
-                }
-                rgba = scaler.pixels;
-            }
-            canvas_image(canvas, rgba, w, h, transform);
-            animation_scaler_free(&scaler);
+            if (info->interpolation == ANIMATION_BICUBIC)
+                canvas_image_bicubic(canvas, clip->frames[0], clip->w, clip->h, transform);
+            else
+                canvas_image(canvas, clip->frames[0], clip->w, clip->h, transform);
         }
     }
 }
