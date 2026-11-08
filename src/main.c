@@ -10,6 +10,12 @@
 
 #define TEXT_SCREEN_FRACTION .07 /* Em size relative to the output height. */
 #define TEXT_RGB 0x0f2f8f        /* Dark blue. */
+#define PEN_RGB 0xe52b37         /* Red freehand ink. */
+#define ARROW_RGB 0xff5a1f       /* Ember orange Shift-drag arrows. */
+#define RECT_RGB 0xd4a800        /* Dark saturated yellow Ctrl/Command-drag boxes. */
+#define PEN_SCREEN_FRACTION .005 /* Pen, arrow and box width relative to the output height. */
+#define ARROW_HEAD 6             /* Arrowhead side length in pen diameters. */
+#define ARROW_ANGLE .49          /* Half-angle of the arrowhead (~28 degrees). */
 
 typedef struct {
     const PdfAnimation *info;
@@ -31,6 +37,9 @@ typedef struct {
     Brush brush;
     int page, w, h;
     bool refresh, dirty, running, down, drawing;
+    bool arrow_stroke; /* The current drag draws a straight arrow (Shift). */
+    bool rect_stroke;  /* The current drag draws a box (Ctrl/Command). */
+    double pen_size;   /* Brush diameter in output pixels, fixed per stroke. */
     Uint8 button;
     Point pressed;
     Ink ink;
@@ -127,10 +136,13 @@ static bool ensure_ink_layer(App *a) {
     }
     return true;
 }
-static bool begin_pen(App *a) {
+static bool begin_pen(App *a, uint32_t rgb) {
     if (!ensure_ink_layer(a))
         return false;
-    if (!brush_begin(&a->brush, &a->ink_canvas, 7, .70, 0xe52b37))
+    /* Like text, a fixed share of the output (screen) height, so strokes look
+     * the same at any resolution or display scale. */
+    a->pen_size = fmax(1, a->h * PEN_SCREEN_FRACTION);
+    if (!brush_begin(&a->brush, &a->ink_canvas, a->pen_size, .70, rgb))
         return SDL_SetError("Cannot allocate pen buffers");
     return true;
 }
@@ -477,6 +489,45 @@ static bool curve_draw(App *a, Curve c) {
     a->dirty = a->ink_dirty = true;
     return ok;
 }
+/* Redraws the stroke's arrow from the press point to the tip. The previous
+ * preview is restored first, so the arrow follows the pointer while earlier
+ * ink below it stays intact. */
+static void arrow_draw(App *a, Point tip) {
+    brush_restore(&a->brush, &a->ink_canvas);
+    Point tail = a->pressed;
+    double dx = tip.x - tail.x, dy = tip.y - tail.y, length = hypot(dx, dy);
+    brush_line(&a->brush, &a->ink_canvas, tail, tip);
+    if (length > 1e-9) {
+        double head = fmin(a->pen_size * ARROW_HEAD, length * .5);
+        double ux = dx / length, uy = dy / length, c = cos(ARROW_ANGLE), s = sin(ARROW_ANGLE);
+        for (int side = -1; side <= 1; side += 2) {
+            Point wing = {tip.x + head * (-ux * c + side * uy * s),
+                          tip.y + head * (-side * ux * s - uy * c)};
+            brush_line(&a->brush, &a->ink_canvas, tip, wing);
+        }
+    }
+    a->dirty = a->ink_dirty = true;
+}
+/* Redraws the stroke's box between the press point and the pointer, with the
+ * same preview behavior as arrow_draw. Max-combined coverage keeps the corners
+ * from darkening where the edges overlap. */
+static void rect_draw(App *a, Point corner) {
+    brush_restore(&a->brush, &a->ink_canvas);
+    Point from = a->pressed, right = {corner.x, from.y}, left = {from.x, corner.y};
+    brush_line(&a->brush, &a->ink_canvas, from, right);
+    brush_line(&a->brush, &a->ink_canvas, right, corner);
+    brush_line(&a->brush, &a->ink_canvas, corner, left);
+    brush_line(&a->brush, &a->ink_canvas, left, from);
+    a->dirty = a->ink_dirty = true;
+}
+/* Shapes are redrawn whole from the press point; only freehand uses a->ink. */
+static bool shape_stroke(const App *a) { return a->arrow_stroke || a->rect_stroke; }
+static void shape_draw(App *a, Point p) {
+    if (a->rect_stroke)
+        rect_draw(a, p);
+    else
+        arrow_draw(a, p);
+}
 static void change_page(App *a, int page) {
     if (page < 0 || page >= pdf_page_count(a->pdf) || page == a->page)
         return;
@@ -514,7 +565,7 @@ static bool event(App *a, SDL_Event *e) {
         a->refresh = true;
         break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
-        if (a->drawing && !curve_draw(a, ink_finish(&a->ink)))
+        if (a->drawing && !shape_stroke(a) && !curve_draw(a, ink_finish(&a->ink)))
             return false;
         a->down = a->drawing = false;
         SDL_CaptureMouse(false);
@@ -552,10 +603,6 @@ static bool event(App *a, SDL_Event *e) {
         case SDLK_T: /* Not during a pen stroke, whose brush owns the ink pixels. */
             if (!a->refresh && !a->down && !text_start(a))
                 return false;
-            break;
-        case SDLK_C:
-        case SDLK_DELETE:
-            a->refresh = true;
             break;
         case SDLK_F:
             if (!SDL_SetWindowFullscreen(a->window,
@@ -603,13 +650,23 @@ static bool event(App *a, SDL_Event *e) {
             (void)wh;
             double threshold = ww > 0 ? 4.0 * a->canvas.w / ww : 4;
             if (!a->drawing && is_drag(a->pressed, p, threshold)) {
-                if (!begin_pen(a))
+                /* Modifiers at the start of the drag pick the shape: Ctrl or
+                 * Command a box, otherwise Shift a straight arrow. */
+                SDL_Keymod mod = SDL_GetModState();
+                a->rect_stroke = (mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0;
+                a->arrow_stroke = !a->rect_stroke && (mod & SDL_KMOD_SHIFT) != 0;
+                if (!begin_pen(a, a->rect_stroke    ? RECT_RGB
+                                  : a->arrow_stroke ? ARROW_RGB
+                                                    : PEN_RGB))
                     return false;
                 a->drawing = true;
-                ink_begin(&a->ink, a->pressed);
+                if (!shape_stroke(a))
+                    ink_begin(&a->ink, a->pressed);
                 SDL_SetCursor(a->arrow);
             }
-            if (a->drawing && !curve_draw(a, ink_add(&a->ink, p)))
+            if (a->drawing && shape_stroke(a))
+                shape_draw(a, p);
+            else if (a->drawing && !curve_draw(a, ink_add(&a->ink, p)))
                 return false;
         } else {
             PdfLink link;
@@ -623,7 +680,10 @@ static bool event(App *a, SDL_Event *e) {
         Point p = position(a, e->button.x, e->button.y);
         a->down = false;
         SDL_CaptureMouse(false);
-        if (a->drawing) {
+        if (a->drawing && shape_stroke(a)) {
+            shape_draw(a, p);
+            a->drawing = false;
+        } else if (a->drawing) {
             if (!curve_draw(a, ink_add(&a->ink, p)) || !curve_draw(a, ink_finish(&a->ink)))
                 return false;
             a->drawing = false;

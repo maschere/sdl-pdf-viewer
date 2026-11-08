@@ -83,9 +83,8 @@ int main(int argc, char **argv) {
     CHECK(present(&a));
     CHECK(a.ink_canvas.pixels[ink + 3] == 255 && a.ink_canvas.pixels[ink] == 0xe5);
     SDL_Event e = {0};
-    e.type = SDL_EVENT_KEY_DOWN;
-    e.key.key = SDLK_C;
-    CHECK(event(&a, &e) && rebuild(&a));
+    a.refresh = true; /* Discarding ink keeps playback. */
+    CHECK(rebuild(&a));
     CHECK(a.playbacks[0].player.playing);
     CHECK(a.ink_canvas.pixels[ink + 3] == 0);
     paused = a.playbacks[0].player.frame;

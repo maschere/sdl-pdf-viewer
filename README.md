@@ -76,11 +76,12 @@ locally and pass `-DFETCHCONTENT_SOURCE_DIR_SDL3=/absolute/path/to/SDL3-3.4.20`.
 | Previous page | Left, Up, Page Up, Backspace, P |
 | First / last page | Home / End |
 | Draw smooth red ink | Hold left or right mouse button and drag |
+| Draw an ember arrow | Hold Shift while dragging |
+| Draw a dark yellow box | Hold Ctrl or Command while dragging |
 | Follow a PDF link | Left-click without dragging |
 | Play / pause an animation | Click its small bottom-center icon |
 | Type dark blue text at the pointer | T, then type; Shift+Enter for a new line |
 | Finish / cancel text | Enter, Down or a click / Escape |
-| Clear current ink | C or Delete |
 | Toggle fullscreen | F |
 | Quit | Escape or Q |
 
@@ -88,10 +89,21 @@ A four-window-coordinate-pixel drag threshold distinguishes link clicks from
 strokes. A click without a drag draws nothing; ink starts only once the mouse
 moves past the threshold. Links show a hand cursor. Ink uses midpoint quadratic
 smoothing, converted to cubic curves and adaptively flattened. Strokes use a
-7-output-pixel-diameter red brush: the inner 70% of its radius is solid, with a
+red brush whose diameter is 0.5% of the output height (about 5 pixels at 1080p,
+11 at 2160p): the inner 70% of its radius is solid, with a
 smooth cubic fade through the outer 30% and a pixel-filtered edge. Coverage is
 combined within each stroke so overlapping segments do not darken its feather.
-The diameter is measured in physical output pixels, including on high-DPI displays.
+Like text, the width is measured in physical output pixels, so strokes look the
+same relative to the slide at any window size, resolution or display scale.
+Holding Shift when a drag starts draws an ember-orange straight arrow instead:
+its shaft runs from the press point to the pointer and it follows the pointer
+until the button is released, with an open arrowhead of two wings six brush
+diameters long at about 28 degrees (shortened to half the length for short arrows). It
+uses the same brush. Shift is read once, when the drag passes the threshold.
+Holding Ctrl or Command at that moment instead draws a dark saturated yellow
+rectangle outline, for boxing parts of a slide: one corner stays at the press
+point and the opposite corner follows the pointer until the button is released.
+It uses the same brush, and takes precedence if Shift is held as well.
 Ink is clipped to the current page. Ink is discarded on navigation,
 resize or fullscreen transitions, and is never written to the PDF. Returning to
 a page shows the clean page. The file is opened read-only.
@@ -141,8 +153,7 @@ Embedded GIF/APNG file attachments play directly within their reserved slide
 boxes. Animations start paused on frame 1; click the small play/pause icon at
 the bottom center of the box. Playback loops while playing. Each frame advances
 at the specified fixed FPS (0.1 to 240), overriding the file's original frame
-delays. Multiple animations have independent controls. Resizing and clearing ink
-preserve playback; leaving a slide and returning starts its animations again
+delays. Multiple animations have independent controls. Resizing preserves playback; leaving a slide and returning starts its animations again
 according to their autoplay settings. Ink appears above the animations.
 
 Copy [latex/sdlpdf-animation.sty](latex/sdlpdf-animation.sty) beside your TeX source:

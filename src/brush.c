@@ -1,6 +1,7 @@
 #include "brush.h"
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
@@ -26,6 +27,8 @@ bool brush_begin(Brush *b, const Canvas *c, double diameter, double hardness, ui
         b->h = c->h;
     }
     memset(b->coverage, 0, (size_t)b->w * b->h);
+    b->x0 = b->y0 = INT_MAX;
+    b->x1 = b->y1 = 0;
     b->radius = diameter * .5;
     b->hardness = hardness;
     b->rgb = rgb;
@@ -79,12 +82,31 @@ void brush_line(Brush *b, Canvas *c, Point from, Point to) {
             if (alpha <= b->coverage[at])
                 continue;
             uint8_t *pixel = c->pixels + at * 4, *base = b->base + at * 4;
-            if (!b->coverage[at])
+            if (!b->coverage[at]) {
                 memcpy(base, pixel, 4);
+                b->x0 = MIN(b->x0, x);
+                b->x1 = MAX(b->x1, x + 1);
+                b->y0 = MIN(b->y0, y);
+                b->y1 = MAX(b->y1, y + 1);
+            }
             else
                 memcpy(pixel, base, 4);
             b->coverage[at] = (uint8_t)alpha;
             canvas_paint(c, x, y, b->rgb, alpha);
         }
     }
+}
+void brush_restore(Brush *b, Canvas *c) {
+    if (!b->coverage || b->w != c->w || b->h != c->h)
+        return;
+    for (int y = b->y0; y < b->y1; y++)
+        for (int x = b->x0; x < b->x1; x++) {
+            size_t at = (size_t)y * b->w + x;
+            if (b->coverage[at]) {
+                memcpy(c->pixels + at * 4, b->base + at * 4, 4);
+                b->coverage[at] = 0;
+            }
+        }
+    b->x0 = b->y0 = INT_MAX;
+    b->x1 = b->y1 = 0;
 }

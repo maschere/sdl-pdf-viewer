@@ -34,7 +34,7 @@ calling `attachfile2`. Use `-halt-on-error` to stop compilation on that error.
 
 Playback loops until paused. The chosen FPS replaces the animation's native
 frame delays. Each animation has its own small play/pause control at the bottom
-center of its box. Resize and ink clearing preserve playback. Returning to a
+center of its box. Resizing preserves playback. Returning to a
 slide restarts its animations according to their autoplay settings.
 
 The command is compatible with XeLaTeX and `attachfile2`. It does not require
