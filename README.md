@@ -110,8 +110,10 @@ locally and pass `-DFETCHCONTENT_SOURCE_DIR_SDL3=/absolute/path/to/SDL3-3.4.20`.
 | Previous page | Left, Up, Page Up, Backspace, P |
 | First / last page | Home / End |
 | Draw smooth red ink | Hold left or right mouse button and drag |
-| Draw an ember arrow | Hold Shift while dragging |
-| Draw a dark yellow box | Hold Ctrl or Command while dragging |
+| Draw an ember arrow | A to start at the pointer; move the mouse; A or left-click to finish |
+| Draw a dark yellow box | R to start at the pointer; move the mouse; R or left-click to finish |
+| Cancel an arrow or box | Right-click |
+| Show clock and page count | Hover in the bottom-right 5% of the PDF page |
 | Follow a PDF link | Left-click without dragging |
 | Play / pause an animation | Click its small bottom-center icon |
 | Type dark blue text at the pointer | T, then type; Shift+Enter for a new line |
@@ -129,15 +131,17 @@ smooth cubic fade through the outer 30% and a pixel-filtered edge. Coverage is
 combined within each stroke so overlapping segments do not darken its feather.
 Like text, the width is measured in physical output pixels, so strokes look the
 same relative to the slide at any window size, resolution or display scale.
-Holding Shift when a drag starts draws an ember-orange straight arrow instead:
-its shaft runs from the press point to the pointer and it follows the pointer
-until the button is released, with an open arrowhead of two wings six brush
+Press A to begin an ember-orange straight arrow immediately at the current pointer:
+its shaft runs from that fixed source to the pointer as the mouse moves,
+with an open arrowhead of two wings six brush
 diameters long at about 28 degrees (shortened to half the length for short arrows). It
-uses the same brush. Shift is read once, when the drag passes the threshold.
-Holding Ctrl or Command at that moment instead draws a dark saturated yellow
-rectangle outline, for boxing parts of a slide: one corner stays at the press
-point and the opposite corner follows the pointer until the button is released.
-It uses the same brush, and takes precedence if Shift is held as well.
+uses the same brush. Press A again or left-click to finish; right-click to cancel.
+Press R to begin a dark saturated yellow rectangle outline: one corner stays at
+the initial pointer position and the opposite corner follows the mouse. Press R
+again or left-click to finish; right-click to cancel. Neither tool requires
+holding a mouse button. Switching between A and R discards the unfinished shape
+and starts the other at the current pointer. Losing focus cancels a pending shape.
+Shift, Ctrl and Command no longer change the drawing tool during a drag.
 Ink is clipped to the current page. Ink is discarded on navigation,
 resize or fullscreen transitions, and is never written to the PDF. Returning to
 a page shows the clean page. The file is opened read-only.
@@ -163,6 +167,11 @@ complex-script shaping are not supported.
 Pages are fitted and letterboxed without changing the display resolution.
 Mouse coordinates are converted through SDL's high-DPI coordinate conversion
 and the inverse PDF page transform, including crop origins and rotation.
+Hover within the rightmost 5% and bottommost 5% of the visible PDF page to show
+a small black rectangle at its bottom-right corner. Its two white text lines show
+the local 24-hour time (`hh:mm`) and current/total page numbers (`x/y`). The text's
+em size is 0.5% of the output height, preserving its relative size across DPI
+scales. The clock updates while the mouse is stationary; moving away hides it.
 
 ```sh
 ./build/sdl-pdf-viewer --windowed file.pdf

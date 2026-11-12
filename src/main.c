@@ -7,12 +7,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define TEXT_SCREEN_FRACTION .07 /* Em size relative to the output height. */
 #define TEXT_RGB 0x0f2f8f        /* Dark blue. */
 #define PEN_RGB 0xe52b37         /* Red freehand ink. */
-#define ARROW_RGB 0xff5a1f       /* Ember orange Shift-drag arrows. */
-#define RECT_RGB 0xd4a800        /* Dark saturated yellow Ctrl/Command-drag boxes. */
+#define ARROW_RGB 0xff5a1f       /* Ember orange arrows. */
+#define RECT_RGB 0xd4a800        /* Dark saturated yellow boxes. */
+#define STATUS_SCREEN_FRACTION .005 /* Status text em size relative to output height. */
+#define STATUS_HOVER_FRACTION .05   /* Bottom-right portion of the page. */
 #define PEN_SCREEN_FRACTION .005 /* Pen, arrow and box width relative to the output height. */
 #define ARROW_HEAD 6             /* Arrowhead side length in pen diameters. */
 #define ARROW_ANGLE .49          /* Half-angle of the arrowhead (~28 degrees). */
@@ -62,8 +65,8 @@ typedef struct App {
     Brush brush;
     int page, w, h;
     bool refresh, dirty, running, down, drawing;
-    bool arrow_stroke; /* The current drag draws a straight arrow (Shift). */
-    bool rect_stroke;  /* The current drag draws a box (Ctrl/Command). */
+    bool arrow_stroke; /* A keyboard-started arrow is being previewed. */
+    bool rect_stroke;  /* A keyboard-started box is being previewed. */
     double pen_size;   /* Brush diameter in output pixels, fixed per stroke. */
     Uint8 button;
     Point pressed;
@@ -82,6 +85,12 @@ typedef struct App {
     SDL_Texture *text_texture;
     SDL_FRect text_rect, caret;
     double text_size; /* Em size in output pixels, fixed while typing. */
+    bool status_visible;
+    SDL_Texture *status_texture;
+    SDL_FRect status_rect;
+    char status_text[64];
+    int status_w, status_h;
+    time_t status_minute;
     /* Background rendering of the neighboring pages. Without started workers,
      * pages are rendered on demand in a->canvas. */
     PageSlot slots[CACHE_SLOTS];
@@ -184,6 +193,16 @@ static bool begin_pen(App *a, uint32_t rgb) {
     return true;
 }
 static Point position(App *a, float wx, float wy);
+static bool ensure_font(App *a) {
+    if (!a->font && !a->font_failed) {
+        a->font = text_font_open_default();
+        if (!a->font) {
+            a->font_failed = true;
+            SDL_Log("No TrueType font found (use --font file.ttf or SDL_PDF_VIEWER_FONT)");
+        }
+    }
+    return a->font != NULL;
+}
 static void text_stop(App *a) {
     if (a->typing)
         SDL_StopTextInput(a->window);
@@ -256,15 +275,7 @@ static bool text_preview(App *a) {
     return ok;
 }
 static bool text_start(App *a) {
-    if (!a->font && !a->font_failed) {
-        a->font = text_font_open_default();
-        if (!a->font) {
-            a->font_failed = true;
-            SDL_Log("Text tool unavailable: no TrueType font found "
-                    "(use --font file.ttf or SDL_PDF_VIEWER_FONT)");
-        }
-    }
-    if (!a->font)
+    if (!ensure_font(a))
         return true;
     float wx = 0, wy = 0;
     SDL_GetMouseState(&wx, &wy);
@@ -680,6 +691,76 @@ static bool cache_show(App *a) {
     SDL_UnlockMutex(a->cache_lock);
     return true;
 }
+static void status_hover(App *a, Point p) {
+    Box b = a->canvas.clip;
+    bool visible = !a->refresh && p.x >= b.x1 - (b.x1 - b.x0) * STATUS_HOVER_FRACTION &&
+                   p.y >= b.y1 - (b.y1 - b.y0) * STATUS_HOVER_FRACTION &&
+                   p.x < b.x1 && p.y < b.y1;
+    if (visible != a->status_visible) {
+        a->status_visible = visible;
+        a->dirty = true;
+    }
+}
+static void status_tick(App *a, time_t now) {
+    if (a->status_visible && now / 60 != a->status_minute)
+        a->dirty = true;
+}
+static bool status_draw(App *a, time_t now) {
+    if (!a->status_visible || !ensure_font(a))
+        return true;
+    struct tm *local = localtime(&now);
+    if (!local)
+        return true;
+    char label[64];
+    snprintf(label, sizeof(label), "%02d:%02d\n%d/%d", local->tm_hour, local->tm_min,
+             a->page + 1, pdf_page_count(a->pdf));
+    if (!a->status_texture || strcmp(label, a->status_text) ||
+        a->status_w != a->w || a->status_h != a->h) {
+        double size = fmax(1, a->h * STATUS_SCREEN_FRACTION);
+        double pad = fmax(1, ceil(size * .3));
+        TextMetrics m = text_metrics(a->font, size);
+        Path path = {0};
+        if (!text_path(a->font, label, size, (Point){pad, pad + m.ascent}, &path, NULL)) {
+            path_free(&path);
+            return SDL_SetError("Cannot lay out status overlay");
+        }
+        double xmax = pad, ymax = pad + m.ascent + m.line_height + m.descent;
+        for (size_t i = 0; i < path.count; i++) {
+            Edge e = path.edges[i];
+            xmax = fmax(xmax, fmax(e.a.x, e.b.x));
+            ymax = fmax(ymax, fmax(e.a.y, e.b.y));
+        }
+        Canvas c = {0};
+        if (!canvas_init(&c, (int)ceil(xmax + pad), (int)ceil(ymax + pad))) {
+            path_free(&path);
+            return SDL_SetError("Cannot allocate status overlay");
+        }
+        canvas_clear(&c, 0x000000);
+        bool ok = canvas_fill(&c, &path, 0xffffff, false);
+        path_free(&path);
+        SDL_DestroyTexture(a->status_texture);
+        a->status_texture = NULL;
+        if (ok) {
+            a->status_texture = SDL_CreateTexture(a->renderer, SDL_PIXELFORMAT_RGBA32,
+                                                  SDL_TEXTUREACCESS_STATIC, c.w, c.h);
+            ok = a->status_texture &&
+                 SDL_SetTextureScaleMode(a->status_texture, SDL_SCALEMODE_NEAREST) &&
+                 SDL_UpdateTexture(a->status_texture, NULL, c.pixels, c.w * 4);
+        }
+        a->status_rect.w = (float)c.w;
+        a->status_rect.h = (float)c.h;
+        canvas_free(&c);
+        if (!ok)
+            return SDL_SetError("Cannot render status overlay");
+        snprintf(a->status_text, sizeof(a->status_text), "%s", label);
+        a->status_w = a->w;
+        a->status_h = a->h;
+    }
+    a->status_minute = now / 60;
+    a->status_rect.x = (float)floor(a->canvas.clip.x1 - a->status_rect.w);
+    a->status_rect.y = (float)floor(a->canvas.clip.y1 - a->status_rect.h);
+    return SDL_RenderTexture(a->renderer, a->status_texture, NULL, &a->status_rect);
+}
 static bool rebuild(App *a) {
     int w, h;
     if (!SDL_GetRenderOutputSize(a->renderer, &w, &h))
@@ -710,6 +791,7 @@ static bool rebuild(App *a) {
         }
     }
     a->down = a->drawing = false;
+    a->arrow_stroke = a->rect_stroke = false;
     SDL_CaptureMouse(false);
     text_stop(a); /* Pending text belongs to the discarded page geometry. */
     if (!a->have_page || a->rendered_page != a->page) {
@@ -733,6 +815,9 @@ static bool rebuild(App *a) {
     if (!setup_playbacks(a))
         return false;
     a->refresh = false;
+    float mx = 0, my = 0;
+    SDL_GetMouseState(&mx, &my);
+    status_hover(a, position(a, mx, my));
     a->dirty = true;
     if (a->worker_count)
         cache_schedule(a);
@@ -774,6 +859,8 @@ static bool present(App *a) {
     for (int i = 0; i < a->playback_count; i++)
         if (!draw_control(a, &a->playbacks[i]))
             return false;
+    if (!status_draw(a, time(NULL)))
+        return false;
     if (!SDL_SetRenderClipRect(a->renderer, NULL) || !SDL_RenderPresent(a->renderer))
         return false;
     a->page_dirty = a->ink_dirty = a->dirty = false;
@@ -838,10 +925,42 @@ static void rect_draw(App *a, Point corner) {
 /* Shapes are redrawn whole from the press point; only freehand uses a->ink. */
 static bool shape_stroke(const App *a) { return a->arrow_stroke || a->rect_stroke; }
 static void shape_draw(App *a, Point p) {
+    if (hypot(p.x - a->pressed.x, p.y - a->pressed.y) < 1e-9) {
+        brush_restore(&a->brush, &a->ink_canvas);
+        a->dirty = a->ink_dirty = true;
+        return;
+    }
     if (a->rect_stroke)
         rect_draw(a, p);
     else
         arrow_draw(a, p);
+}
+static void shape_stop(App *a, bool cancel) {
+    if (cancel) {
+        brush_restore(&a->brush, &a->ink_canvas);
+        a->dirty = a->ink_dirty = true;
+    }
+    a->arrow_stroke = a->rect_stroke = a->drawing = false;
+}
+static bool shape_toggle(App *a, bool rectangle) {
+    if (a->refresh || a->down)
+        return true;
+    if (shape_stroke(a)) {
+        bool same = rectangle == a->rect_stroke;
+        shape_stop(a, !same); /* Switching tools discards the unfinished shape. */
+        if (same)
+            return true;
+    }
+    float mx = 0, my = 0;
+    SDL_GetMouseState(&mx, &my);
+    if (!begin_pen(a, rectangle ? RECT_RGB : ARROW_RGB))
+        return false;
+    a->pressed = position(a, mx, my);
+    a->rect_stroke = rectangle;
+    a->arrow_stroke = !rectangle;
+    a->drawing = true;
+    SDL_SetCursor(a->arrow);
+    return true;
 }
 static void change_page(App *a, int page) {
     if (page < 0 || page >= pdf_page_count(a->pdf) || page == a->page)
@@ -850,6 +969,7 @@ static void change_page(App *a, int page) {
     a->page = page;
     a->refresh = true;
     a->down = a->drawing = false;
+    a->arrow_stroke = a->rect_stroke = false;
     SDL_CaptureMouse(false);
     SDL_SetCursor(a->arrow);
 }
@@ -869,6 +989,18 @@ static bool event(App *a, SDL_Event *e) {
     case SDL_EVENT_WINDOW_EXPOSED:
         a->dirty = true;
         break;
+    case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+        if (a->status_visible) {
+            a->status_visible = false;
+            a->dirty = true;
+        }
+        break;
+    case SDL_EVENT_WINDOW_MOUSE_ENTER: {
+        float mx = 0, my = 0;
+        SDL_GetMouseState(&mx, &my);
+        status_hover(a, position(a, mx, my));
+        break;
+    }
     case SDL_EVENT_RENDER_DEVICE_RESET:
     case SDL_EVENT_RENDER_TARGETS_RESET:
         SDL_DestroyTexture(a->texture);
@@ -877,6 +1009,8 @@ static bool event(App *a, SDL_Event *e) {
         a->ink_texture = NULL;
         SDL_DestroyTexture(a->text_texture);
         a->text_texture = NULL;
+        SDL_DestroyTexture(a->status_texture);
+        a->status_texture = NULL;
         for (int i = 0; i < a->playback_count; i++) {
             SDL_DestroyTexture(a->playbacks[i].texture);
             a->playbacks[i].texture = NULL;
@@ -887,6 +1021,8 @@ static bool event(App *a, SDL_Event *e) {
     case SDL_EVENT_WINDOW_FOCUS_LOST:
         if (a->drawing && !shape_stroke(a) && !curve_draw(a, ink_finish(&a->ink)))
             return false;
+        if (shape_stroke(a))
+            shape_stop(a, true);
         a->down = a->drawing = false;
         SDL_CaptureMouse(false);
         break;
@@ -920,8 +1056,12 @@ static bool event(App *a, SDL_Event *e) {
         case SDLK_END:
             change_page(a, pdf_page_count(a->pdf) - 1);
             break;
+        case SDLK_A:
+            return shape_toggle(a, false);
+        case SDLK_R:
+            return shape_toggle(a, true);
         case SDLK_T: /* Not during a pen stroke, whose brush owns the ink pixels. */
-            if (!a->refresh && !a->down && !text_start(a))
+            if (!a->refresh && !a->down && !a->drawing && !text_start(a))
                 return false;
             break;
         case SDLK_F:
@@ -949,6 +1089,14 @@ static bool event(App *a, SDL_Event *e) {
          * dot nor follows a link. */
         if (a->typing)
             return text_commit(a);
+        if (shape_stroke(a) && !a->refresh) {
+            if (e->button.button == SDL_BUTTON_LEFT) {
+                shape_draw(a, position(a, e->button.x, e->button.y));
+                shape_stop(a, false);
+            } else if (e->button.button == SDL_BUTTON_RIGHT)
+                shape_stop(a, true);
+            break; /* Consume the click, including its later button-up. */
+        }
         if (a->refresh || a->down ||
             (e->button.button != SDL_BUTTON_LEFT && e->button.button != SDL_BUTTON_RIGHT))
             break;
@@ -964,29 +1112,22 @@ static bool event(App *a, SDL_Event *e) {
         if (a->refresh)
             break;
         Point p = position(a, e->motion.x, e->motion.y);
-        if (a->down) {
+        status_hover(a, p);
+        if (shape_stroke(a)) {
+            shape_draw(a, p);
+        } else if (a->down) {
             int ww = 0, wh = 0;
             SDL_GetWindowSize(a->window, &ww, &wh);
             (void)wh;
             double threshold = ww > 0 ? 4.0 * a->canvas.w / ww : 4;
             if (!a->drawing && is_drag(a->pressed, p, threshold)) {
-                /* Modifiers at the start of the drag pick the shape: Ctrl or
-                 * Command a box, otherwise Shift a straight arrow. */
-                SDL_Keymod mod = SDL_GetModState();
-                a->rect_stroke = (mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0;
-                a->arrow_stroke = !a->rect_stroke && (mod & SDL_KMOD_SHIFT) != 0;
-                if (!begin_pen(a, a->rect_stroke    ? RECT_RGB
-                                  : a->arrow_stroke ? ARROW_RGB
-                                                    : PEN_RGB))
+                if (!begin_pen(a, PEN_RGB))
                     return false;
                 a->drawing = true;
-                if (!shape_stroke(a))
-                    ink_begin(&a->ink, a->pressed);
+                ink_begin(&a->ink, a->pressed);
                 SDL_SetCursor(a->arrow);
             }
-            if (a->drawing && shape_stroke(a))
-                shape_draw(a, p);
-            else if (a->drawing && !curve_draw(a, ink_add(&a->ink, p)))
+            if (a->drawing && !curve_draw(a, ink_add(&a->ink, p)))
                 return false;
         } else {
             PdfLink link;
@@ -1000,10 +1141,7 @@ static bool event(App *a, SDL_Event *e) {
         Point p = position(a, e->button.x, e->button.y);
         a->down = false;
         SDL_CaptureMouse(false);
-        if (a->drawing && shape_stroke(a)) {
-            shape_draw(a, p);
-            a->drawing = false;
-        } else if (a->drawing) {
+        if (a->drawing) {
             if (!curve_draw(a, ink_add(&a->ink, p)) || !curve_draw(a, ink_finish(&a->ink)))
                 return false;
             a->drawing = false;
@@ -1176,12 +1314,15 @@ int main(int argc, char **argv) {
         if (a.refresh && !rebuild(&a))
             goto done;
         tick_animations(&a, SDL_GetTicksNS());
+        status_tick(&a, time(NULL));
         /* A pending rebuild (e.g. a minimized window after a device reset)
          * may have no display texture yet. */
         if (a.dirty && !a.refresh && !present(&a))
             goto done;
         SDL_Event e;
         int wait = animation_wait(&a, SDL_GetTicksNS());
+        if (a.status_visible && (wait < 0 || wait > 1000))
+            wait = 1000; /* Refresh the clock even while the pointer is still. */
         if (wait < 0) {
             if (!SDL_WaitEvent(&e))
                 goto done;
@@ -1209,6 +1350,7 @@ done:
     cache_stop(&a);
     free_playbacks(&a);
     SDL_DestroyTexture(a.text_texture);
+    SDL_DestroyTexture(a.status_texture);
     text_font_free(a.font);
     brush_free(&a.brush);
     canvas_free(&a.ink_canvas);
