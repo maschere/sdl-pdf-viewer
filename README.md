@@ -106,8 +106,8 @@ locally and pass `-DFETCHCONTENT_SOURCE_DIR_SDL3=/absolute/path/to/SDL3-3.4.20`.
 
 | Action | Input |
 | --- | --- |
-| Next page | Right, Down, Page Down, Space, N |
-| Previous page | Left, Up, Page Up, Backspace, P |
+| Next page | Right, Down, Page Down, Space, N, mouse wheel down |
+| Previous page | Left, Up, Page Up, Backspace, P, mouse wheel up |
 | First / last page | Home / End |
 | Draw smooth red ink | Hold left or right mouse button and drag |
 | Draw an ember arrow | A to start at the pointer; move the mouse; A or left-click to finish |
@@ -170,8 +170,10 @@ and the inverse PDF page transform, including crop origins and rotation.
 Hover within the rightmost 5% and bottommost 5% of the visible PDF page to show
 a small black rectangle at its bottom-right corner. Its two white text lines show
 the local 24-hour time (`hh:mm`) and current/total page numbers (`x/y`). The text's
-em size is 0.5% of the output height, preserving its relative size across DPI
+em size is 2% of the output height, preserving its relative size across DPI
 scales. The clock updates while the mouse is stationary; moving away hides it.
+Each vertical mouse-wheel event navigates one page, regardless of scroll distance;
+horizontal scrolling is ignored. Wheel navigation is disabled while typing text.
 
 ```sh
 ./build/sdl-pdf-viewer --windowed file.pdf
@@ -265,7 +267,7 @@ CRC/sequence errors are rejected.
 | Images | Image XObjects, raw/Flate/JPEG, DeviceGray/DeviceRGB/Indexed and D65 CalRGB |
 | Sample depth | Gray/Indexed 1, 2, 4, 8 bits; RGB 8 bits per component |
 | Image predictors | TIFF predictor 2 for 8-bit data; PNG predictors 10–15 |
-| Image masks | DeviceGray SMask alpha, including Decode inversion; resampled to image dimensions |
+| Image masks | Color-key Mask ranges before Decode; DeviceGray SMask alpha, including Decode inversion and RGB/Gray/CalRGB Matte unblending; resampled to image dimensions |
 | Image Decode | Per-component ranges, including inverted samples |
 | Links | Direct Dest, GoTo actions, legacy destination dictionaries, destination name trees |
 | Browser links | URI actions for HTTP/HTTPS through SDL_OpenURL |
@@ -275,7 +277,8 @@ bicubic filter, widened when shrinking so that fine detail averages instead of
 aliasing; animations default to nearest-neighbor instead. CFF hints are parsed but no grid fitting is
 applied. DeviceCMYK uses a sampled default output conversion table, interpolated
 in portable C. It is an explicit approximation, not document-specific ICC color
-management. D65 CalRGB images are converted through their gamma/matrix into sRGB.
+management. D65 CalRGB images and Indexed palettes with a D65 CalRGB base are
+converted through their gamma/matrix into sRGB.
 The optional `tools/make_cmyk_table.py` can regenerate the numeric color samples;
 it uses a development-time reference library, not a runtime PDF dependency.
 Destination view modes (Fit, XYZ, etc.) navigate to the correct page and fit that
@@ -286,7 +289,7 @@ opening, or remote-PDF navigation.
 
 Unsupported features still include composite (CIDFontType2), symbolic and
 non-WinAnsi TrueType fonts, WinAnsi/MacRoman-encoded Type 1 fonts, OpenType font programs, non-Identity composite encodings, simple-font encoding overrides,
-inline images, CMYK/ICC/Separation images, stencil/color-key masks, Matte images,
+inline images, CMYK/ICC/Separation images, stencil and explicit image masks, Indexed Matte images,
 non-normal blend modes, general transparency group isolation/knockout, arbitrary
 radial circle arrangements, dashed strokes, patterns, encryption, hybrid xrefs
 and incremental updates. Font clipping modes, CFF arithmetic operators and

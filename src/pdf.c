@@ -1192,22 +1192,25 @@ static unsigned char *image(Pdf *d, Value *v, int *width, int *height, int depth
     Value *mask = get(d, v, "ImageMask");
     if (mask && mask->kind == WORD && !strcmp(mask->text, "true"))
         fail(d, "Stencil images unsupported");
-    if (get(d, v, "Mask") || get(d, v, "Matte"))
-        fail(d, "Color-key masks and Matte images unsupported");
     Value *cs = get(d, v, "ColorSpace");
     int components = 0, indexed = 0, palette_components = 0, high = 0;
     bool calibrated = false;
     double gamma[3] = {1, 1, 1}, calmatrix[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     const unsigned char *palette = NULL;
     size_t palette_size = 0;
-    if (named(cs, "DeviceRGB"))
+    Value *base = cs;
+    if (cs && cs->kind == ARRAY && cs->count == 4 && named(item(d, cs, 0), "Indexed")) {
+        indexed = 1;
+        base = item(d, cs, 1);
+    }
+    if (named(base, "DeviceRGB"))
         components = 3;
-    else if (named(cs, "DeviceGray"))
+    else if (named(base, "DeviceGray"))
         components = 1;
-    else if (cs && cs->kind == ARRAY && cs->count == 2 && named(item(d, cs, 0), "CalRGB")) {
+    else if (base && base->kind == ARRAY && base->count == 2 && named(item(d, base, 0), "CalRGB")) {
         components = 3;
         calibrated = true;
-        Value *params = item(d, cs, 1), *a = get(d, params, "Gamma"), *m = get(d, params, "Matrix");
+        Value *params = item(d, base, 1), *a = get(d, params, "Gamma"), *m = get(d, params, "Matrix");
         if (a)
             for (int k = 0; k < 3; k++)
                 gamma[k] = num(d, item(d, a, k));
@@ -1218,11 +1221,10 @@ static unsigned char *image(Pdf *d, Value *v, int *width, int *height, int depth
         if (!wp || fabs(num(d, item(d, wp, 0)) - .95046) > .002 ||
             fabs(num(d, item(d, wp, 2)) - 1.08906) > .002)
             fail(d, "CalRGB currently requires D65 white point");
-    } else if (cs && cs->kind == ARRAY && cs->count == 4 && named(item(d, cs, 0), "Indexed")) {
-        Value *base = item(d, cs, 1);
-        palette_components = named(base, "DeviceRGB") ? 3 : named(base, "DeviceGray") ? 1 : 0;
-        if (!palette_components)
-            fail(d, "Indexed image base must be RGB or Gray");
+    } else
+        fail(d, "Images require DeviceRGB, DeviceGray, CalRGB or an Indexed palette with such a base");
+    if (indexed) {
+        palette_components = components;
         high = integer(d, item(d, cs, 2), 0, 255);
         Value *lookup = item(d, cs, 3);
         if (lookup->kind == STRING) {
@@ -1236,9 +1238,7 @@ static unsigned char *image(Pdf *d, Value *v, int *width, int *height, int depth
         if (palette_size < (size_t)(high + 1) * palette_components)
             fail(d, "Truncated image palette");
         components = 1;
-        indexed = 1;
-    } else
-        fail(d, "Images require DeviceRGB, DeviceGray or Indexed color space");
+    }
     Value *bpc = get(d, v, "BitsPerComponent");
     int bits = bpc ? integer(d, bpc, 1, 8) : 8;
     if ((bits != 1 && bits != 2 && bits != 4 && bits != 8) || (components == 3 && bits != 8))
@@ -1298,15 +1298,65 @@ static unsigned char *image(Pdf *d, Value *v, int *width, int *height, int depth
             upper[k] = num(d, item(d, decode, 2 * k + 1));
         }
     }
+    /* SMask takes precedence over Mask. Color-key ranges refer to the raw
+     * samples, before Decode, palette lookup or color-space conversion. */
+    Value *smask = get(d, v, "SMask");
+    if (named(smask, "None"))
+        smask = NULL;
+    Value *key = smask ? NULL : get(d, v, "Mask");
+    int key_low[3] = {0}, key_high[3] = {0};
+    if (key) {
+        if (key->kind != ARRAY)
+            fail(d, "Explicit image masks unsupported");
+        if (key->count != (size_t)components * 2)
+            fail(d, "Invalid image color-key mask array");
+        for (int k = 0; k < components; k++) {
+            key_low[k] = integer(d, item(d, key, 2 * k), 0, (1 << bits) - 1);
+            key_high[k] = integer(d, item(d, key, 2 * k + 1), 0, (1 << bits) - 1);
+            if (key_low[k] > key_high[k])
+                fail(d, "Invalid image color-key mask range");
+        }
+    }
+    int mw = 0, mh = 0;
+    unsigned char *alpha = NULL;
+    Value *matte = NULL;
+    double matte_color[3] = {0};
+    if (smask) {
+        if (!named(get(d, smask, "ColorSpace"), "DeviceGray"))
+            fail(d, "Soft mask requires DeviceGray");
+        alpha = image(d, smask, &mw, &mh, depth + 1);
+        matte = get(d, smask, "Matte");
+        if (matte) {
+            if (indexed)
+                fail(d, "Matte requires a non-Indexed image color space");
+            if (matte->kind != ARRAY || matte->count != (size_t)components || mw != w || mh != h)
+                fail(d, "Invalid image Matte array or dimensions");
+            for (int k = 0; k < components; k++) {
+                matte_color[k] = num(d, item(d, matte, k));
+                if (matte_color[k] < 0 || matte_color[k] > 1)
+                    fail(d, "Invalid image Matte component");
+            }
+        }
+    }
     size_t row = ((size_t)w * components * bits + 7) / 8;
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++) {
             unsigned char values[3] = {0, 0, 0};
+            bool transparent = key != NULL;
+            unsigned char opacity = alpha ? alpha[((size_t)(y * mh / h) * mw + x * mw / w) * 4]
+                                          : 255;
             for (int k = 0; k < components; k++) {
                 size_t bit = ((size_t)x * components + k) * bits;
                 int sample =
                     (samples[y * row + bit / 8] >> (8 - bits - (bit % 8))) & ((1 << bits) - 1);
+                if (key && (sample < key_low[k] || sample > key_high[k]))
+                    transparent = false;
                 double a = low[k] + (upper[k] - low[k]) * sample / ((1 << bits) - 1);
+                /* Undo preblending in the source color space, before rounding
+                 * to bytes or converting CalRGB. Fully transparent pixels
+                 * have no recoverable color and must not divide by zero. */
+                if (matte)
+                    a = opacity ? matte_color[k] + (a - matte_color[k]) * 255 / opacity : 0;
                 a = MAX(0, MIN(indexed ? high : 1, a));
                 values[k] = (unsigned char)(indexed ? (int)(a + .5) : (int)(a * 255 + .5));
             }
@@ -1331,18 +1381,8 @@ static unsigned char *image(Pdf *d, Value *v, int *width, int *height, int depth
                     p[k] = (unsigned char)(MAX(0, MIN(1, a)) * 255 + .5);
                 }
             }
-            p[3] = 255;
+            p[3] = transparent ? 0 : opacity;
         }
-    Value *smask = get(d, v, "SMask");
-    if (smask && !named(smask, "None")) {
-        if (!named(get(d, smask, "ColorSpace"), "DeviceGray"))
-            fail(d, "Soft mask requires DeviceGray");
-        int mw, mh;
-        unsigned char *m = image(d, smask, &mw, &mh, depth + 1);
-        for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++)
-                rgba[((size_t)y * w + x) * 4 + 3] = m[((size_t)(y * mh / h) * mw + x * mw / w) * 4];
-    }
     size_t bytes = (size_t)w * h * 4;
     if (!depth && !d->image_cache_closed && bytes <= IMAGE_CACHE_LIMIT - d->image_cache_bytes) {
         v->rgba = malloc(bytes);

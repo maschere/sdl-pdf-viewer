@@ -35,6 +35,14 @@ static void press(App *a, SDL_Keycode key, SDL_Keymod mod) {
     e.key.mod = mod;
     CHECK(event(a, &e));
 }
+static void wheel(App *a, float x, float y, SDL_MouseWheelDirection direction) {
+    SDL_Event e = {0};
+    e.type = SDL_EVENT_MOUSE_WHEEL;
+    e.wheel.x = x;
+    e.wheel.y = y;
+    e.wheel.direction = direction;
+    CHECK(event(a, &e));
+}
 static void start_shape(App *a, SDL_Keycode key, float x, float y) {
     SDL_WarpMouseInWindow(a->window, x, y);
     press(a, key, 0);
@@ -406,6 +414,7 @@ int main(int argc, char **argv) {
     press(&a, SDLK_A, 0);
     press(&a, SDLK_R, 0);
     press(&a, SDLK_SPACE, 0);
+    wheel(&a, 0, -1, SDL_MOUSEWHEEL_NORMAL);
     CHECK(a.page == 0 && !a.refresh && a.typing && !shape_stroke(&a));
     type(&a, "t");
     CHECK(!strcmp(a.text, "Ht"));
@@ -474,6 +483,25 @@ int main(int argc, char **argv) {
     key.key.key = SDLK_HOME;
     CHECK(event(&a, &key));
     CHECK(a.page == 0);
+    CHECK(rebuild(&a));
+    /* Vertical wheel events move one page, including fractional/fast input;
+     * horizontal input and attempts to pass either end do nothing. */
+    wheel(&a, 0, 1, SDL_MOUSEWHEEL_NORMAL);
+    wheel(&a, 1, 0, SDL_MOUSEWHEEL_NORMAL);
+    CHECK(a.page == 0 && !a.refresh);
+    wheel(&a, 0, -8, SDL_MOUSEWHEEL_NORMAL);
+    CHECK(a.page == 1 && a.refresh);
+    CHECK(rebuild(&a));
+    wheel(&a, 0, -1, SDL_MOUSEWHEEL_NORMAL);
+    CHECK(a.page == 1 && !a.refresh);
+    wheel(&a, 0, .25f, SDL_MOUSEWHEEL_NORMAL);
+    CHECK(a.page == 0 && a.refresh);
+    CHECK(rebuild(&a));
+    wheel(&a, 0, 1, SDL_MOUSEWHEEL_FLIPPED);
+    CHECK(a.page == 1 && a.refresh);
+    CHECK(rebuild(&a));
+    wheel(&a, 0, -1, SDL_MOUSEWHEEL_FLIPPED);
+    CHECK(a.page == 0 && a.refresh);
     CHECK(rebuild(&a));
     /* Pages from the background cache match pages rendered on demand. */
     Canvas expected = {0};

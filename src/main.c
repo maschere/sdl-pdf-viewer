@@ -14,7 +14,7 @@
 #define PEN_RGB 0xe52b37         /* Red freehand ink. */
 #define ARROW_RGB 0xff5a1f       /* Ember orange arrows. */
 #define RECT_RGB 0xd4a800        /* Dark saturated yellow boxes. */
-#define STATUS_SCREEN_FRACTION .005 /* Status text em size relative to output height. */
+#define STATUS_SCREEN_FRACTION .02  /* Status text em size relative to output height. */
 #define STATUS_HOVER_FRACTION .05   /* Bottom-right portion of the page. */
 #define PEN_SCREEN_FRACTION .005 /* Pen, arrow and box width relative to the output height. */
 #define ARROW_HEAD 6             /* Arrowhead side length in pen diameters. */
@@ -1084,6 +1084,20 @@ static bool event(App *a, SDL_Event *e) {
         }
         SDL_HideCursor();
         return text_insert(a, e->text.text);
+    case SDL_EVENT_MOUSE_WHEEL: {
+        if (a->typing)
+            break;
+        float y = e->wheel.y;
+        if (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
+            y = -y;
+        /* Each vertical wheel event moves exactly one page, regardless of
+         * wheel speed or fractional high-resolution scroll distance. */
+        if (y > 0)
+            change_page(a, a->page - 1);
+        else if (y < 0)
+            change_page(a, a->page + 1);
+        break;
+    }
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         /* A click finishes pending text and is consumed: it neither leaves a
          * dot nor follows a link. */
